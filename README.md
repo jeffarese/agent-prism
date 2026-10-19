@@ -13,15 +13,10 @@ the accounts of one tool only.
 Platform: macOS only. agent-prism reads Claude logins from the macOS
 Keychain.
 
-```
- ▐▛███▛█   Claude Code
- ...                                   (the normal Claude Code screen)
- ❯
-──────────────────────────────────────────────────────────── agent-prism · smart ─
- ● Acme Al   team  5h ███████▌░░░░░░░  48% ↻2h14m  7d ████▊░░░░░░░░░░ 31% ↻3d4h
- ○ Acme Bea  team  5h ▏░░░░░░░░░░░░░░   1%         7d ██████████▉░░░░ 72% ↻21h  next ▸
- ⌃\ menu · session 3f2a91c0 · on Acme Al since 10:42 · usage 40s ago
-```
+![agp starts Claude on the best account, hits the 5-hour limit, and resumes the conversation on the next account](docs/demo.gif)
+
+The demo uses fictional accounts and a stand-in for `claude`
+([demo/](demo/); `demo/record.sh` records it again).
 
 ## Install
 
