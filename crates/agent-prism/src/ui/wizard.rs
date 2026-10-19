@@ -173,7 +173,7 @@ impl Wizard {
             message: None,
             result: None,
             login_cmd: None,
-            fetch_usage: true,
+            fetch_usage: !crate::launch::polling_disabled(),
         };
         w.rediscover();
         w

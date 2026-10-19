@@ -15,8 +15,8 @@ Keychain.
 
 ![agp starts Claude on the best account, hits the 5-hour limit, and resumes the conversation on the next account](docs/demo.gif)
 
-The demo uses fictional accounts and a stand-in for `claude`
-([demo/](demo/); `demo/record.sh` records it again).
+The demo and the images below use fictional accounts and a stand-in for
+`claude` ([demo/](demo/); `demo/record.sh` records them again).
 
 ## Install
 
@@ -28,15 +28,47 @@ scripts/install.sh        # builds and installs ~/.local/bin/agp
 
 Set `AGP_INSTALL_DIR` to install to a different directory.
 
+## First run
+
+The first `agp` starts a short setup. Nothing changes on disk until the last
+step, except things that you confirm on the way.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/onboarding-welcome.png" alt="Welcome screen"><br>
+      <b>1. Welcome.</b> What agent-prism does.</td>
+    <td width="50%"><img src="docs/images/onboarding-accounts.png" alt="Accounts step"><br>
+      <b>2. Accounts.</b> agent-prism finds the Claude and Codex logins on
+      this Mac. Choose the ones to use and give them short names.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/onboarding-sharing.png" alt="Sharing step"><br>
+      <b>3. Sharing.</b> Accounts share <code>~/.claude</code> (settings,
+      skills, memory, sessions), so a conversation can move between them.
+      Logins stay separate.</td>
+    <td><img src="docs/images/onboarding-balancing.png" alt="Balancing step"><br>
+      <b>4. Balancing.</b> How to pick the account for a new session, and
+      what to do when an account hits its limit.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/onboarding-dock.png" alt="Dock step"><br>
+      <b>5. Dock.</b> How the usage dock under Claude looks, with a
+      preview.</td>
+    <td><img src="docs/images/onboarding-done.png" alt="Done step"><br>
+      <b>6. Done.</b> A summary. Enter saves the config and starts
+      Claude.</td>
+  </tr>
+</table>
+
 ## Use
 
 ```sh
 agp                     # first run: onboarding; then Claude on the best account
-agp --as acme-bea       # pin an account for this session
+agp --as personal       # pin an account for this session
 agp -- --help           # claude flags pass through; agent-prism flags go first
 agp -p "question"       # print mode: drop-in for claude -p on the best account
 agp codex               # Codex on the best ChatGPT account
-agp codex --as work     # Codex on one account; codex args follow as usual
+agp codex --as chatgpt  # Codex on one account; codex args follow as usual
 agp status              # usage table of all accounts (--json, --watch)
 agp pick --codex        # the ChatGPT account a new session would use
 agp settings            # settings, full screen
@@ -54,6 +86,17 @@ account it says so on stderr and runs claude anyway.
 In a session, `⌃\` opens the menu: switch account now, settings, accounts,
 refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
 (or Codex).
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/switch.png" alt="Switch account menu"><br>
+      <b>Switch account now.</b> Move the conversation to another account
+      at any time.</td>
+    <td width="50%"><img src="docs/images/status.png" alt="agp status output"><br>
+      <b><code>agp status</code>.</b> The usage of all accounts, and the
+      account that a new session would use.</td>
+  </tr>
+</table>
 
 ## How it works
 

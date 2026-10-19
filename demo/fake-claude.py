@@ -70,12 +70,21 @@ class Fake:
         self.sid = self.opts.get("--resume") or self.opts.get("--session-id") or "demo-session"
         home = Path(os.environ["HOME"])
         self.transcript = home / ".claude" / "projects" / f"{self.sid}.log"
-        cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude"))
+        # The default install (no CLAUDE_CONFIG_DIR) keeps it in ~/.claude.json.
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        account_file = Path(cfg) / ".claude.json" if cfg else home / ".claude.json"
         try:
-            acct = json.loads((cfg / ".claude.json").read_text())["oauthAccount"]
+            acct = json.loads(account_file.read_text())["oauthAccount"]
         except (OSError, ValueError, KeyError):
             acct = {}
         self.who = " · ".join(x for x in (acct.get("emailAddress"), acct.get("organizationName")) if x)
+
+    def event(self, name):
+        """Logs a story event for the captions (demo/captions.py)."""
+        path = os.environ.get("DEMO_EVENTS")
+        if path:
+            with open(path, "a") as f:
+                f.write(f"{name} {time.time():.3f}\n")
 
     def hook(self, event, **payload):
         cmd = self.hooks.get(event)
@@ -118,10 +127,12 @@ class Fake:
             cache.write_text(json.dumps(data))
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        self.event("limit")
         self.out(f"  {RED}⎿  5-hour limit reached · resets 4:20pm{R}", keep=False)
         self.hook("StopFailure", error="rate_limit")
 
     def first_turn(self, text):
+        self.event("prompt")
         self.out(f"{BOLD}❯{R} {text}")
         self.out()
         self.hook("UserPromptSubmit", prompt=text)
@@ -153,11 +164,13 @@ class Fake:
         self.out()
         self.out(f"{BOLD}⏺{R} Done. fetchJson() now retries 3 times (250 ms, 500 ms, 1 s).")
         self.out()
+        self.event("done")
         self.hook("Stop")
 
     def run(self):
         self.banner()
         if self.resumed:
+            self.event("resume")
             print(f"{DIM}  ↻ resumed session {self.sid[:8]}{R}")
             print()
             if self.transcript.exists():
