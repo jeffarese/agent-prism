@@ -10,6 +10,11 @@ Business): it starts `codex` on the ChatGPT account with the most quota left
 and resumes the thread on another account (`codex resume`). A session uses
 the accounts of one tool only.
 
+In scripts and CI, `agp` is a drop-in for `claude -p` and `codex exec`:
+`agp -p "..."` and `agp codex exec "..."` run on the best account, with the
+same args, stdin, stdout, stderr and exit code. See
+[Drop-in for `claude -p` and `codex exec`](#drop-in-for-claude--p-and-codex-exec).
+
 Platform: macOS only. agent-prism reads Claude logins from the macOS
 Keychain.
 
