@@ -1,0 +1,22 @@
+[package]
+name = "prism-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prism-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+vt100.workspace = true
+rustix.workspace = true
+libc.workspace = true
+signal-hook.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/prism-core", "crates/prism-usage", "crates/prism-term", "crates/agent-prism"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+prism-core = { path = "crates/prism-core" }
+prism-usage = { path = "crates/prism-usage" }
+prism-term = { path = "crates/prism-term" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.23"
+dirs = "6"
+sha2 = "0.10"
+hex = "0.4"
+jiff = "0.2"
+uuid = { version = "1", features = ["v4"] }
+fs4 = "1"
+ureq = { version = "3", features = ["json"] }
+ratatui = "0.30"
+crossterm = "0.29"
+vt100 = "0.16"
+tui-term = "0.3"
+rustix = { version = "1", features = ["termios", "process", "pty", "stdio", "fs"] }
+libc = "0.2"
+signal-hook = "0.3"
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+log = "0.4"
