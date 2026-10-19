@@ -69,6 +69,7 @@ agp -- --help           # claude flags pass through; agent-prism flags go first
 agp -p "question"       # print mode: drop-in for claude -p on the best account
 agp codex               # Codex on the best ChatGPT account
 agp codex --as chatgpt  # Codex on one account; codex args follow as usual
+agp codex exec "task"   # drop-in for codex exec on the best ChatGPT account
 agp status              # usage table of all accounts (--json, --watch)
 agp pick --codex        # the ChatGPT account a new session would use
 agp settings            # settings, full screen
@@ -79,9 +80,42 @@ agp doctor              # health check
 ```
 
 agent-prism flags (`--as`, `--policy`, `--dock`) only count before the claude
-args. Any `claude -p ...` line works as `agp -p ...`: same args, stdin,
-stdout and exit code. agent-prism never prompts there; if it can't pick an
-account it says so on stderr and runs claude anyway.
+(or codex) args.
+
+## Drop-in for `claude -p` and `codex exec`
+
+Put `agp` in front of a `claude` line, or replace `codex` with `agp codex`.
+Nothing else in the line changes.
+
+| Before | After |
+| --- | --- |
+| `claude -p "summarize the diff"` | `agp -p "summarize the diff"` |
+| `git diff \| claude -p "review" --output-format json` | `git diff \| agp -p "review" --output-format json` |
+| `codex exec "fix the failing test"` | `agp codex exec "fix the failing test"` |
+| `codex exec --json - < prompt.md > out.jsonl` | `agp codex exec --json - < prompt.md > out.jsonl` |
+| `codex exec resume --last "go on"` | `agp codex exec resume --last "go on"` |
+| `codex review --uncommitted` | `agp codex review --uncommitted` |
+
+For these lines agent-prism picks the account, sets its env, and then
+replaces itself with `claude` or `codex` (the same process). There is no
+dock and no wrapper in the pipe, so scripts, CI jobs and other agents get:
+
+- the same args, in the same order
+- the same stdin, stdout and stderr (agent-prism writes nothing to stdout)
+- the same exit code.
+
+agent-prism never prompts there. If it can't pick an account (no config, no
+accounts, all accounts limited), it writes one line to stderr and runs the
+tool anyway. Add `--as <id>` or `--policy <p>` before the tool args to
+control the pick: `agp codex --as work exec "task"`.
+
+`agp -p` (or `--print`) is Claude's print mode. For Codex, every line that
+does not start the TUI runs this way: `exec` (`e`), `review`, `login`,
+`mcp`, `--help` and the other subcommands, but not `resume` and `fork`.
+All Codex accounts use one thread database, so `exec resume` finds a thread
+that another account started.
+
+## In a session
 
 In a session, `⌃\` opens the menu: switch account now, settings, accounts,
 refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
