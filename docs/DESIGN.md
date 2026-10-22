@@ -69,7 +69,7 @@ args = []                # extra args for every `agp codex` launch
 policy = "smart"         # smart | priority | round-robin | headroom
 on_limit = "auto"        # auto | ask | stay
 countdown_secs = 5
-resume_prompt = "continue"   # sent as the first prompt after a limit switch; "" = none
+resume_prompt = "continue"   # first prompt after a limit switch when Claude has work (§9); "" = none
 soft_5h = 90             # new sessions avoid an account at/over this 5h %
 hard = 98                # at/over this % a window counts as limited
 
@@ -475,8 +475,10 @@ authentication_failed, billing_error, invalid_request, model_not_found,
 server_error, max_output_tokens, cloud_credential_error, unknown`, plus
 `error_details` and `last_assistant_message`.
 
-State: `session_id` (latest `SessionStart`), `busy` (after
-`UserPromptSubmit` until `Stop`/`StopFailure`), `last_failure`.
+State: `session_id` and `transcript_path` (latest `SessionStart`), `busy`
+(after `UserPromptSubmit` until `Stop`/`StopFailure`), `last_failure`.
+`busy` misses turns that no user prompt starts: a teammate message, a task
+notification, or a `/goal` Stop hook that keeps Claude working.
 
 ## 9. Switching
 
@@ -493,7 +495,16 @@ user ("Switch account now" in the menu, pick a target or "best").
 4. SIGTERM to the child's process group; wait ≤ 3 s; SIGKILL.
 5. Spawn on the target with the same cwd and args, minus the user's session
    flags and positional prompt, plus `--resume <session_id>` and, for a limit
-   trigger with `resume_prompt` set, the prompt as a positional argument.
+   trigger with `resume_prompt` set, a first prompt as a positional argument
+   when Claude has work to carry on: a `StopFailure` stopped the turn, or the
+   end of the transcript shows an open turn (an unanswered prompt, teammate
+   message, notification or tool result, or a running tool) or an active
+   `/goal` (the latest `goal_status` attachment is neither met nor failed).
+   Claude Code restores the goal on `--resume`, but its Stop hook only acts
+   when a turn ends; without a prompt the resumed session waits for input.
+   The prompt is a one-line note (account, limit, and that background tasks
+   and subagents of the old process have stopped), a blank line, then
+   `resume_prompt`. The transcript scan reads at most the last 64 MB.
 6. If the new child exits non-zero within 5 s, show the error and offer
    "go back".
 7. Requires shared `projects/` in both profiles; else the switch item is

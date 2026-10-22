@@ -22,6 +22,7 @@ mod logging;
 mod session;
 mod status;
 mod tokens;
+mod transcript;
 mod ui;
 
 use std::ffi::OsString;

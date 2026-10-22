@@ -123,6 +123,8 @@ pub struct SessionHost {
     since: i64,
     started_at: i64,
     session_id: Option<String>,
+    /// The transcript of `session_id` (from `SessionStart`).
+    transcript: Option<std::path::PathBuf>,
     busy: bool,
     last_failure: Option<String>,
     message: Option<(StatusMessage, i64)>,
@@ -171,6 +173,7 @@ impl SessionHost {
             projections: HashMap::new(),
             since: now,
             started_at: now,
+            transcript: None,
             busy: false,
             last_failure: None,
             message: None,
@@ -441,13 +444,49 @@ impl SessionHost {
         }
     }
 
-    /// Moves the session to `target` (§9 steps 4–5). Returns false when
-    /// refused (a message says why).
-    /// `interrupted`: a limit stopped the last turn, so send the resume prompt.
+    /// The first prompt after the limit switch `p`, or `None` when Claude
+    /// has nothing to carry on. Turns that a teammate message, a task
+    /// notification or a `/goal` Stop hook starts fire no
+    /// `UserPromptSubmit`, so `busy` and `interrupted` miss them; the
+    /// transcript shows them. A restored `/goal` acts only when a turn
+    /// ends, so it needs a prompt too.
+    fn limit_prompt(&self, p: &Pending) -> Option<String> {
+        let resume = &self.config.balance.resume_prompt;
+        if resume.is_empty() {
+            return None;
+        }
+        if !p.interrupted {
+            let tail = self
+                .transcript
+                .as_deref()
+                .map(crate::transcript::inspect)
+                .unwrap_or_default();
+            log::info!(
+                "transcript at switch: goal {}, open turn {}",
+                tail.goal,
+                tail.open_turn
+            );
+            if !tail.goal && !tail.open_turn {
+                return None;
+            }
+        }
+        Some(format!(
+            "[agent-prism] Account {} {}, so this conversation moved to account {} \
+             and `{}` restarted. Background tasks and subagents that ran in the old \
+             process have stopped; start again the ones you still need.\n\n{resume}",
+            self.label(&self.active),
+            p.reason,
+            self.label(&p.target),
+            self.tool.bin(),
+        ))
+    }
+
+    /// Moves the session to `target` (§9 steps 4–5), with `prompt` as the
+    /// first prompt. Returns false when refused (a message says why).
     fn perform_switch(
         &mut self,
         target: &str,
-        interrupted: bool,
+        prompt: Option<String>,
         ctl: &mut Control<UiAction>,
     ) -> bool {
         self.pending = None;
@@ -471,8 +510,6 @@ impl SessionHost {
             self.set_message(MessageLevel::Error, format!("unknown profile {target}"));
             return false;
         };
-        let prompt = (interrupted && !self.config.balance.resume_prompt.is_empty())
-            .then(|| self.config.balance.resume_prompt.clone());
         let start = Start::Resume {
             session_id: sid.clone(),
             prompt,
@@ -561,6 +598,10 @@ impl SessionHost {
             "SessionStart" => {
                 if let Some(id) = payload.get("session_id").and_then(Value::as_str) {
                     self.session_id = Some(id.to_string());
+                    self.transcript = payload
+                        .get("transcript_path")
+                        .and_then(Value::as_str)
+                        .map(std::path::PathBuf::from);
                     self.write_registry();
                 }
                 let key = self
@@ -715,8 +756,8 @@ impl SessionHost {
             && p.kind == PendingKind::Auto
             && now >= p.deadline
         {
-            let (target, interrupted) = (p.target.clone(), p.interrupted);
-            self.perform_switch(&target, interrupted, ctl);
+            let (target, prompt) = (p.target.clone(), self.limit_prompt(p));
+            self.perform_switch(&target, prompt, ctl);
         }
         if now - self.last_check >= CHECK_SECS {
             self.last_check = now;
@@ -762,7 +803,7 @@ impl SessionHost {
                 };
                 match target {
                     Some(t) => {
-                        self.perform_switch(&t, false, ctl);
+                        self.perform_switch(&t, None, ctl);
                     }
                     None => self.set_message(MessageLevel::Error, "No other account to switch to"),
                 }
@@ -770,7 +811,8 @@ impl SessionHost {
             UiAction::ConfirmSwitch => {
                 ctl.close_panel();
                 if let Some(p) = self.pending.clone() {
-                    self.perform_switch(&p.target, p.interrupted, ctl);
+                    let prompt = self.limit_prompt(&p);
+                    self.perform_switch(&p.target, prompt, ctl);
                 }
             }
             UiAction::CancelSwitch => {
@@ -1038,7 +1080,16 @@ mod tests {
         let a = args(&spec);
         assert_eq!(a[..2], ["--model", "opus"]);
         assert!(!a.contains(&"fix it".to_string()));
-        assert_eq!(a[a.len() - 3..], ["--resume", "sess-1234567", "continue"]);
+        assert_eq!(a[a.len() - 3..a.len() - 1], ["--resume", "sess-1234567"]);
+        let prompt = &a[a.len() - 1];
+        assert!(
+            prompt.starts_with(
+                "[agent-prism] Account Acct A hit the 5h limit, so this conversation \
+                 moved to account Acct B and `claude` restarted."
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("\n\ncontinue"), "{prompt}");
         assert_eq!(env(&spec, "CLAUDE_CONFIG_DIR"), Some(f.b_dir.as_os_str()));
         assert_eq!(env(&spec, "AGP_PROFILE").unwrap(), "b");
         assert_eq!(env(&spec, "AGP_LABEL").unwrap(), "Acct B");
@@ -1082,26 +1133,90 @@ mod tests {
         assert_eq!(cd.to_label, "Acct B");
     }
 
-    #[test]
-    fn polled_limit_waits_for_idle_and_sends_no_prompt() {
-        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+    /// A session whose transcript holds `lines`; returns its path.
+    fn start_with_transcript(f: &mut Fixture, lines: &[Value]) -> std::path::PathBuf {
+        let path = f.b_dir.parent().unwrap().join("sess-1.jsonl");
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, text).unwrap();
         hook(
             &mut f.host,
             "SessionStart",
-            serde_json::json!({"session_id":"sess-1"}),
+            serde_json::json!({"session_id":"sess-1","transcript_path":path}),
         );
+        path
+    }
+
+    /// Runs the countdown of a polled limit (idle session) to the switch.
+    fn polled_switch_args(f: &mut Fixture) -> Vec<String> {
+        f.host.check_active_limit();
+        let cd = f.host.dock_model().countdown.expect("countdown");
+        let mut ctl = Control::default();
+        f.host.test_now = Some(cd.deadline + 1);
+        f.host.on_event(HostEvent::Tick, &mut ctl);
+        args(&ctl.take_restart().expect("restart"))
+    }
+
+    fn finished_turn() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"user","message":{"role":"user","content":"fix it"}}),
+            serde_json::json!({"type":"assistant","message":{"model":"m","stop_reason":"end_turn",
+                "content":[{"type":"text","text":"done"}]}}),
+        ]
+    }
+
+    fn goal_line() -> Value {
+        serde_json::json!({"type":"attachment","attachment":{"type":"goal_status",
+            "met":false,"sentinel":true,"condition":"ship it"}})
+    }
+
+    #[test]
+    fn polled_limit_waits_for_idle_and_sends_no_prompt() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        start_with_transcript(&mut f, &finished_turn());
         hook(&mut f.host, "UserPromptSubmit", serde_json::json!({}));
         // Busy: a limit seen by polling must not start a countdown.
         f.host.check_active_limit();
         assert!(f.host.dock_model().countdown.is_none());
         // The turn ends normally: now the countdown starts.
         hook(&mut f.host, "Stop", serde_json::json!({}));
-        let cd = f.host.dock_model().countdown.expect("countdown");
-        let mut ctl = Control::default();
-        f.host.test_now = Some(cd.deadline + 1);
-        f.host.on_event(HostEvent::Tick, &mut ctl);
-        let a = args(&ctl.take_restart().expect("restart"));
-        // No turn was interrupted, so no resume prompt.
+        let a = polled_switch_args(&mut f);
+        // The turn is finished and there is no goal, so no resume prompt.
+        assert_eq!(a[a.len() - 2..], ["--resume", "sess-1"]);
+    }
+
+    /// A `/goal` session: Claude Code restores the goal on resume, but it
+    /// needs a turn to act on, so the switch sends the prompt.
+    #[test]
+    fn polled_limit_with_goal_sends_prompt() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        let mut lines = vec![goal_line()];
+        lines.extend(finished_turn());
+        start_with_transcript(&mut f, &lines);
+        let a = polled_switch_args(&mut f);
+        assert_eq!(a[a.len() - 3..a.len() - 1], ["--resume", "sess-1"]);
+        assert!(a[a.len() - 1].ends_with("\n\ncontinue"));
+    }
+
+    /// A teammate message started a turn (no `UserPromptSubmit`, so not
+    /// busy) and the switch cut it before any reply.
+    #[test]
+    fn polled_limit_with_open_turn_sends_prompt() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        let mut lines = finished_turn();
+        lines.push(serde_json::json!({"type":"user","message":{"role":"user",
+            "content":"Another Claude session sent a message: report"}}));
+        start_with_transcript(&mut f, &lines);
+        assert!(!f.host.busy);
+        let a = polled_switch_args(&mut f);
+        assert!(a[a.len() - 1].starts_with("[agent-prism] Account Acct A"));
+    }
+
+    #[test]
+    fn empty_resume_prompt_sends_none() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        f.host.config.balance.resume_prompt.clear();
+        start_with_transcript(&mut f, &[goal_line()]);
+        let a = polled_switch_args(&mut f);
         assert_eq!(a[a.len() - 2..], ["--resume", "sess-1"]);
     }
 
