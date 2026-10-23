@@ -567,8 +567,10 @@ agent-prism launch flags count only as a leading prefix. The first other arg and
 everything after it go to claude unchanged; a leading `--` ends agent-prism's
 flags. Lines with `-p/--print` always go to claude, even `agp status -p`
 (`exec` and `hook` excepted). agent-prism adds its own args before any user `--`.
-Inside an agent-prism session (`AGP_SOCK` set), interactive `agp` warns and execs plain
-claude.
+Inside an agent-prism session (`AGP_SOCK` set and its socket accepts a connection),
+interactive `agp` warns and execs plain claude. A dead socket is an `AGP_SOCK` left in a
+multiplexer (herdr, tmux) started from a session that has since exited, so `agp` starts a
+full session there.
 
 ## 12. Codex (ChatGPT plans)
 

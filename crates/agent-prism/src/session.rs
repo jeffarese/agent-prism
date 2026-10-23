@@ -3,8 +3,9 @@
 //! non-interactive line) and in nested agent-prism sessions.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -38,6 +39,13 @@ pub fn confirm(question: &str) -> bool {
 fn exec(mut cmd: Command, tool: Tool) -> Result<i32> {
     let err = cmd.exec();
     Err(err).with_context(|| format!("starting {}", tool.bin()))
+}
+
+/// Whether the agent-prism session listening on `sock` is still running. A
+/// multiplexer (herdr, tmux) started inside a session keeps its `AGP_SOCK`
+/// after that session exits; its panes are not nested.
+fn session_alive(sock: &Path) -> bool {
+    UnixStream::connect(sock).is_ok()
 }
 
 /// Execs the tool for print mode; if that fails, exits 127 like a shell.
@@ -88,7 +96,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         return run_print(&ctx, &args);
     }
     // Nested agent-prism (interactive): run the plain tool.
-    if prism_core::env::var_os("AGP_SOCK").is_some() {
+    if prism_core::env::var_os("AGP_SOCK").is_some_and(|s| session_alive(Path::new(&s))) {
         eprintln!(
             "agp: already inside an agent-prism session; starting plain {}",
             tool.bin()
@@ -489,6 +497,20 @@ mod tests {
             key: "k".into(),
             at_base: true,
         })
+    }
+
+    #[test]
+    fn session_alive_needs_a_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ctl.sock");
+        assert!(!session_alive(&sock));
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(session_alive(&sock));
+        // Dropping the listener would race with children that other tests
+        // fork; a leftover file with no listener behind it stands in.
+        let stale = dir.path().join("stale.sock");
+        std::fs::write(&stale, "").unwrap();
+        assert!(!session_alive(&stale));
     }
 
     #[test]

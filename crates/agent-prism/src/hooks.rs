@@ -63,7 +63,9 @@ pub fn serve(sock: &Path, tx: Sender<ExternalEvent<SessionEvent>>) -> Result<()>
                 let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut r = BufReader::new(conn.take(MAX_PAYLOAD + 4096));
                 let mut line = String::new();
-                if r.read_line(&mut line).is_err() {
+                // An empty connection is a nested agp checking that this
+                // session is alive.
+                if r.read_line(&mut line).is_err() || line.is_empty() {
                     continue;
                 }
                 match parse_line(&line) {
