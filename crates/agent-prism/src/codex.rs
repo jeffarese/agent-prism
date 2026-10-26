@@ -218,14 +218,23 @@ fn looks_like_id(s: &str) -> bool {
 
 /// The SQL for [`find_thread`]; `full` uses the newer columns. `col` is
 /// `created_at` or `updated_at` (unix seconds).
-fn thread_query(cwd: &str, since_ms: i64, account: Option<&str>, full: bool, col: &str) -> String {
+fn thread_query(
+    cwd: &str,
+    since_ms: i64,
+    account: Option<&str>,
+    full: bool,
+    col: &str,
+    user_only: bool,
+) -> String {
     let mut q = format!(
         "SELECT id FROM threads WHERE cwd = {} AND {col} >= {} AND archived = 0",
         sql_str(cwd),
         since_ms / 1000
     );
     if full {
-        q.push_str(" AND (thread_source IS NULL OR thread_source = 'user')");
+        if user_only {
+            q.push_str(" AND (thread_source IS NULL OR thread_source = 'user')");
+        }
         if let Some(a) = account {
             q.push_str(&format!(
                 " AND (creator_account_id IS NULL OR creator_account_id = {})",
@@ -241,14 +250,21 @@ fn thread_query(cwd: &str, since_ms: i64, account: Option<&str>, full: bool, col
 /// `account` when the database records it). Read-only; `None` on any
 /// error.
 pub fn find_thread(db: &Path, cwd: &Path, since_ms: i64, account: Option<&str>) -> Option<String> {
-    query_thread(db, cwd, since_ms, account, "created_at")
+    query_thread(db, cwd, since_ms, account, "created_at", true)
 }
 
 /// The user thread in `cwd` updated most recently at or after `since_ms`:
 /// the thread that a `resume` without an id (picker, `--last`, a name)
 /// opened.
 pub fn find_updated_thread(db: &Path, cwd: &Path, since_ms: i64) -> Option<String> {
-    query_thread(db, cwd, since_ms, None, "updated_at")
+    query_thread(db, cwd, since_ms, None, "updated_at", true)
+}
+
+/// The newest thread in `cwd` created (else updated) at or after
+/// `since_ms`, whatever started it: the thread of a `codex exec` run.
+pub fn find_exec_thread(db: &Path, cwd: &Path, since_ms: i64) -> Option<String> {
+    query_thread(db, cwd, since_ms, None, "created_at", false)
+        .or_else(|| query_thread(db, cwd, since_ms, None, "updated_at", false))
 }
 
 fn query_thread(
@@ -257,6 +273,7 @@ fn query_thread(
     since_ms: i64,
     account: Option<&str>,
     col: &str,
+    user_only: bool,
 ) -> Option<String> {
     let cwd = cwd.to_str()?;
     for full in [true, false] {
@@ -265,7 +282,7 @@ fn query_thread(
             .arg("-noheader")
             .args(["-cmd", ".timeout 2000"])
             .arg(db)
-            .arg(thread_query(cwd, since_ms, account, full, col))
+            .arg(thread_query(cwd, since_ms, account, full, col, user_only))
             .output()
             .ok()?;
         if out.status.success() {
@@ -351,13 +368,14 @@ mod tests {
         let cwd = tmp.path().canonicalize().unwrap();
         assert_eq!(work_dir(&v(&["-C", "p"]), &cwd), cwd.join("p"));
         assert_eq!(work_dir(&v(&["hi"]), &cwd), cwd);
-        let q = thread_query("/a'b", 5_000, Some("acc"), true, "created_at");
+        let q = thread_query("/a'b", 5_000, Some("acc"), true, "created_at", true);
         assert!(
             q.contains("cwd = '/a''b'") && q.contains("created_at >= 5"),
             "{q}"
         );
         assert!(q.contains("creator_account_id = 'acc'"));
-        assert!(!thread_query("/a", 0, Some("acc"), false, "created_at").contains("creator"));
+        assert!(!thread_query("/a", 0, Some("acc"), false, "created_at", true).contains("creator"));
+        assert!(!thread_query("/a", 0, None, true, "created_at", false).contains("thread_source"));
         assert!(looks_like_id("01a14e86-cd99-7222-a279-4ad443c24843"));
         assert!(!looks_like_id("Error: x"));
     }

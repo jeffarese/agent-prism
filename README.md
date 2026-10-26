@@ -76,6 +76,8 @@ agp codex               # Codex on the best ChatGPT account
 agp codex --as chatgpt  # Codex on one account; codex args follow as usual
 agp codex exec "task"   # drop-in for codex exec on the best ChatGPT account
 agp status              # usage table of all accounts (--json, --watch)
+agp dashboard           # usage, history and runs in the browser
+agp skill install       # teach Claude and Codex agents to use agp
 agp pick --codex        # the ChatGPT account a new session would use
 agp settings            # settings, full screen
 agp add [id]            # add an account; asks Claude or Codex, then logs in
@@ -84,8 +86,8 @@ agp adopt <id>          # show how a profile dir would share ~/.claude (--apply)
 agp doctor              # health check
 ```
 
-agent-prism flags (`--as`, `--policy`, `--dock`) only count before the claude
-(or codex) args.
+agent-prism flags (`--as`, `--policy`, `--dock` and the per-run options
+below) only count before the claude (or codex) args.
 
 ## Drop-in for `claude -p` and `codex exec`
 
@@ -120,6 +122,85 @@ does not start the TUI runs this way: `exec` (`e`), `review`, `login`,
 All Codex accounts use one thread database, so `exec resume` finds a thread
 that another account started.
 
+## Per-run options
+
+These change one run and never the config. Like the other agent-prism flags
+they go before the claude (or codex) args.
+
+| Option | Effect |
+| --- | --- |
+| `--on-limit switch` | On a limit, move the conversation to the best other account (config: `auto`). |
+| `--on-limit wait` | Keep the account, wait for its reset, then go on with the same conversation there. |
+| `--on-limit stay` / `ask` | Only tell / ask first (as in the config). |
+| `--on-limit fail` | `-p` and `codex exec` only: exit 75 instead of running or waiting on a limited account. |
+| `--max-wait <dur>` | Wait at most this long for a reset (`90m`, `2h`, `1d`). Longer: `-p` exits 75, a session stays and tells you. |
+| `--accounts <ids>` | Use only these accounts (comma-separated), in the pool or not. |
+| `--exclude <ids>` | Never use these accounts. |
+| `--max-usage <pct>` | An account at or over this 5h or weekly % counts as limited: it is not picked, and in a session reaching it is a limit. |
+
+```sh
+agp --on-limit wait --max-wait 6h -p "migrate the tests" --output-format json
+agp --on-limit fail -p "review" > review.md   # 75: all usable accounts limited
+agp --max-usage 70 --exclude personal -p "batch job"
+agp codex --on-limit wait exec "fix the build"
+agp --on-limit wait                           # a session that waits instead of moving
+```
+
+Without `--on-limit`, `agp -p` and `agp codex exec` replace themselves with
+the tool as described above. With it, agent-prism stays the parent process
+so it can act on a limit: it waits or moves, then resumes the conversation
+(`claude -p --resume <id>`, `codex exec resume <id>`) with a one-line note
+and `continue` (`balance.resume_prompt`). stdin goes to the first attempt;
+the stdout of an attempt that a limit stopped is dropped, so a script gets
+only the final answer, except `--output-format stream-json` and
+`codex exec --json`, which stream. The exit code is the last attempt's, or
+75 (`EX_TEMPFAIL`) when agent-prism gives up on a limit. Ctrl+C and
+`SIGTERM` go to the tool; during a wait they end agent-prism.
+
+What a script gets after a resume: the same conversation (same session id),
+so Claude has the whole task in context and goes on where it stopped, but
+the final output is its reply to the resume note. With
+`--output-format json`, `result`, `total_cost_usd`, `usage` and `num_turns`
+cover the last attempt only. A wait can take hours (cap it with
+`--max-wait`). Claude Code itself does not wait for a usage limit: in `-p`
+it exits with an error (it only retries short API errors), so without
+`--on-limit` that error is what the script gets.
+
+`wait` is also a config value (`balance.on_limit = "wait"`, in
+`agp settings` → Balancing).
+
+## Agents: the agp skill
+
+`agp skill install` writes an `agp` skill to `~/.claude/skills/agp` and
+`~/.codex/skills/agp`. All accounts of a tool share that dir, so every
+Claude and Codex agent knows to use `agp -p` / `agp codex exec`, the
+per-run options and `agp status` without finding them out again. Run it
+again after an update (it says "up to date" when nothing changed);
+`agp skill` prints the text.
+
+## Dashboard
+
+`agp dashboard` serves a usage dashboard on `127.0.0.1` and opens it in the
+browser (`--port <n>` picks the port, `--no-open` only prints the URL;
+Ctrl+C stops it). It shows:
+
+- every account now: 5-hour and weekly use with reset countdowns and the
+  projected use at reset, limited, stale or expired logins, live sessions,
+  and the account the next session of each tool goes to, with the reason
+- the use of each account over the last 24 hours or 7 days, with the limit
+  hits marked
+- a timeline of runs per account, with switches and limit hits
+- run time, runs and tokens by account, project, mode (interactive or
+  scripted) and model, and when in the week the agents run
+- a feed of limits, waits and switches, and a table of runs.
+
+Runs come from the run journal (`~/.local/state/agent-prism/runs.jsonl`).
+Token counts come from the Claude transcripts and Codex rollout files of
+the sessions in the journal; agent-prism reads only those files. While the
+dashboard runs, it refreshes the usage of every account every
+`usage.poll_idle_secs`. The page works offline, answers only requests to
+`127.0.0.1` or `localhost`, and never shows a token.
+
 ## In a session
 
 In a session, `⌃\` opens the menu: switch account now, settings, accounts,
@@ -151,6 +232,10 @@ refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
   path, so memory writes through the shared symlink don't prompt.
 - agent-prism adds its hooks with `claude --settings`; your `settings.json` does
   not change.
+- A folder you trust on one Claude account is trusted on all of them:
+  before Claude starts, agent-prism adds the other accounts' trusted folders
+  to that account's `.claude.json` (it never removes trust). Turn it off with
+  `[share] sync_trust = false`.
 - A Codex account is a `CODEX_HOME` dir (`~/.codex-<id>`). Its login
   (`auth.json`) stays in the dir; `config.toml`, `AGENTS.md`, skills,
   prompts, memories and the session files are symlinks into `~/.codex`.

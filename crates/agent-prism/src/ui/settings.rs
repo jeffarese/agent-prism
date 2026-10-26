@@ -64,10 +64,11 @@ const POLICIES: [(Policy, &str, &str); 4] = [
     ),
 ];
 
-const ON_LIMIT: [(OnLimit, &str, &str); 3] = [
+const ON_LIMIT: [(OnLimit, &str, &str); 4] = [
     (OnLimit::Auto, "auto", "move on after a short countdown"),
     (OnLimit::Ask, "ask", "ask before moving"),
     (OnLimit::Stay, "stay", "only tell me"),
+    (OnLimit::Wait, "wait", "wait for the reset, then go on"),
 ];
 
 const MODES: [(DockMode, &str); 4] = [
@@ -1689,7 +1690,7 @@ mod tests {
         assert_eq!(saved(&f).balance.policy, Policy::Priority);
         // Views have valid tokens; priority picks the first: Ann.
         assert!(render(&mut p, 120, 40).contains("Next session → Ann"));
-        for _ in 0..9 {
+        for _ in 0..10 {
             p.handle_key(key(KeyCode::Down)); // Limited at
         }
         for _ in 0..10 {

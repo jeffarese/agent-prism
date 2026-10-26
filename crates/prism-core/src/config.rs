@@ -226,11 +226,23 @@ impl Default for ProfileConfig {
 }
 
 /// `[share]`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShareConfig {
     pub extra_shared: Vec<String>,
     pub extra_local: Vec<String>,
+    /// Give every Claude account the folder trust of the others (§4.7).
+    pub sync_trust: bool,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        ShareConfig {
+            extra_shared: Vec::new(),
+            extra_local: Vec::new(),
+            sync_trust: true,
+        }
+    }
 }
 
 impl Config {
@@ -387,6 +399,7 @@ extra_local = ["state"]
         assert_eq!(cfg.dock.show, DockShow::All);
         assert_eq!(cfg.dock.mode, DockMode::Compact);
         assert_eq!(cfg.share.extra_local, vec!["state"]);
+        assert!(cfg.share.sync_trust);
         let paths = Paths::under(std::path::Path::new("/r"));
         let ps = cfg.profiles(&paths);
         assert_eq!(ps[0].dir, PathBuf::from("/r/home/.claude-work"));

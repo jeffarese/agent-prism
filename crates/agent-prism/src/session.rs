@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use prism_core::config::Config;
-use prism_core::model::Tool;
+use prism_core::journal::{EventKind, Recorder, RunMode};
+use prism_core::model::{OnLimit, Tool};
 use prism_core::profile::Profile;
 use prism_core::registry;
 use prism_term::runner::{ExternalEvent, Runner, RunnerOptions};
@@ -19,7 +20,7 @@ use prism_usage::balance::fmt_duration;
 use prism_usage::poller::{PollTarget, Poller, PollerConfig};
 
 use crate::app::AppCtx;
-use crate::cli::LaunchArgs;
+use crate::cli::{LaunchArgs, LimitAction};
 use crate::host::{HostInit, SessionEvent, SessionHost};
 use crate::launch::{self, SpecBuilder, Start, unix_now};
 use crate::live::Live;
@@ -49,7 +50,7 @@ fn session_alive(sock: &Path) -> bool {
 }
 
 /// Execs the tool for print mode; if that fails, exits 127 like a shell.
-fn exec_print(mut cmd: Command, tool: Tool) -> Result<i32> {
+pub(crate) fn exec_print(mut cmd: Command, tool: Tool) -> Result<i32> {
     let err = cmd.exec();
     eprintln!("agp: starting {}: {err}", tool.bin());
     Ok(127)
@@ -93,7 +94,13 @@ impl Drop for RunGuard {
 pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
     let tool = args.tool;
     if args.print_mode() {
+        if args.run.on_limit.is_some() {
+            return crate::supervise::run(&ctx, &args);
+        }
         return run_print(&ctx, &args);
+    }
+    if args.run.on_limit == Some(LimitAction::Fail) {
+        bail!("--on-limit fail is for -p and codex exec; use stay or wait in a session");
     }
     // Nested agent-prism (interactive): run the plain tool.
     if prism_core::env::var_os("AGP_SOCK").is_some_and(|s| session_alive(Path::new(&s))) {
@@ -110,7 +117,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // A config with no accounts (e.g. only a backup target) also starts the
     // onboarding; the wizard keeps its other settings.
-    let config = match Config::load(&ctx.paths)?.filter(|c| !c.profiles.is_empty()) {
+    let mut config = match Config::load(&ctx.paths)?.filter(|c| !c.profiles.is_empty()) {
         Some(c) => c,
         None if tty && !args.print_mode() => match crate::ui::run_onboarding(ctx.clone())? {
             Some(c) => c,
@@ -121,6 +128,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
             ctx.paths.config_file().display()
         ),
     };
+    args.run.apply(&mut config, tool)?;
     let profiles = config.profiles_for(&ctx.paths, tool);
     if profiles.is_empty() {
         let flag = if tool.is_claude() { "" } else { " --codex" };
@@ -141,12 +149,13 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         .flatten();
 
     let profile = choose(&ctx, &config, &profiles, &tokens, &args, model.clone(), tty)?;
-    let Some(profile) = profile else {
+    let Some((profile, reason)) = profile else {
         return Ok(1);
     };
     log::info!("starting {} on {}", tool.bin(), profile.id);
     let program = ctx.tool_bin(&config, tool)?;
     let now = unix_now();
+    let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Tui, now);
     launch::touch_last_used(&ctx.paths, &profile.id, now);
 
     let user_settings = user_settings
@@ -173,6 +182,11 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
     };
     guard.sock = builder.sock();
     let (spec, session_id) = builder.build(&config, &profile, &Start::Fresh)?;
+    let mut ev = journal.event(EventKind::Start, &profile.id, now);
+    ev.reason = Some(reason);
+    ev.session = session_id.clone();
+    ev.cwd = Some(builder.cwd.to_string_lossy().into_owned());
+    journal.write(ev);
 
     let dock_mode = args.dock.unwrap_or(config.dock.mode);
     let (mut runner, tx) = Runner::<SessionEvent, crate::actions::UiAction>::new(RunnerOptions {
@@ -216,9 +230,13 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         active: profile.id.clone(),
         session_id,
         poller,
+        run: args.run.clone(),
+        journal: journal.clone(),
     });
     host.write_registry();
     let outcome = runner.run(&mut host, spec)?;
+    let (active, session) = host.journal_end();
+    journal.end(&active, unix_now(), outcome.exit_code, session);
     drop(host);
     drop(guard);
     Ok(outcome.exit_code)
@@ -227,7 +245,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
 /// Print mode: like `claude -p`, plus the account env and settings (codex:
 /// a non-interactive line plus the account env). Never prompts, never
 /// blocks; when agent-prism can't pick it still runs the tool.
-fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
+pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
     let tool = args.tool;
     let loaded = Config::load(&ctx.paths);
     let (config, reason) = match loaded {
@@ -331,7 +349,14 @@ fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         }
     };
     log::info!("print mode on {}", profile.id);
-    launch::touch_last_used(&ctx.paths, &profile.id, unix_now());
+    let now = unix_now();
+    launch::touch_last_used(&ctx.paths, &profile.id, now);
+    let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Exec, now);
+    let mut ev = journal.event(EventKind::Start, &profile.id, now);
+    ev.cwd = std::env::current_dir()
+        .ok()
+        .map(|d| d.to_string_lossy().into_owned());
+    journal.write(ev);
     if tool == Tool::Codex {
         let (_, config_args) = config.tool_bin_args(tool);
         let mut cmd = Command::new(&program);
@@ -364,7 +389,7 @@ fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
 /// value goes through unchanged so claude reports its own error. When
 /// `mem` (given the user and overlay values) returns a memory dir, the
 /// result is inline JSON with `autoMemoryDirectory` added.
-fn print_settings(
+pub(crate) fn print_settings(
     user: Option<String>,
     overlay: Option<&std::path::Path>,
     mem: impl FnOnce(
@@ -417,7 +442,7 @@ fn print_settings(
 
 /// Print-mode args: config, profile, then the user args with agent-prism's
 /// `--settings` before any user `--`.
-fn print_args(
+pub(crate) fn print_args(
     config: &Config,
     profile: &Profile,
     user_args: &[String],
@@ -432,7 +457,9 @@ fn print_args(
     out
 }
 
-/// `--as`, or the balancer's pick (asking when all are limited).
+/// `--as`, or the balancer's pick (asking when all are limited), with the
+/// reason for the journal. With `on_limit = wait` a session starts on the
+/// account that resets first and waits there.
 fn choose(
     ctx: &AppCtx,
     config: &Config,
@@ -441,30 +468,38 @@ fn choose(
     args: &LaunchArgs,
     model: Option<String>,
     tty: bool,
-) -> Result<Option<Profile>> {
+) -> Result<Option<(Profile, String)>> {
     if let Some(id) = &args.as_profile {
         return profiles
             .iter()
             .find(|p| &p.id == id)
             .cloned()
-            .map(Some)
+            .map(|p| Some((p, "pinned with --as".into())))
             .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"));
     }
     let snap = launch::snapshot(ctx, config, profiles, tokens, args.policy, model);
     if let Some(id) = &snap.pick.chosen {
         log::info!("pick {id}: {}", snap.pick.reason);
-        return Ok(profiles.iter().find(|p| &p.id == id).cloned());
+        return Ok(profiles
+            .iter()
+            .find(|p| &p.id == id)
+            .cloned()
+            .map(|p| (p, snap.pick.reason.clone())));
     }
     let Some((label, until)) = snap.pick.earliest_reset.clone() else {
         bail!("no account to use: {}", snap.pick.reason);
     };
     let fallback = profiles.iter().find(|p| p.label == label).cloned();
-    let q = format!(
-        "All pool accounts are limited; {label} resets in {}. Start on it anyway?",
-        fmt_duration(until - snap.ctx.now)
-    );
+    let resets = format!("{label} resets in {}", fmt_duration(until - snap.ctx.now));
+    if config.balance.on_limit == OnLimit::Wait
+        && let Some(p) = fallback.clone()
+    {
+        eprintln!("agp: all pool accounts are limited; {resets}; starting there to wait");
+        return Ok(Some((p, format!("all limited, {resets}"))));
+    }
+    let q = format!("All pool accounts are limited; {resets}. Start on it anyway?");
     if tty && fallback.is_some() && confirm(&q) {
-        return Ok(fallback);
+        return Ok(fallback.map(|p| (p, format!("all limited, {resets}"))));
     }
     eprintln!(
         "agp: all pool accounts are limited; {label} resets in {}",

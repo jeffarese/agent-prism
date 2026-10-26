@@ -244,6 +244,8 @@ pub enum OnLimit {
     Auto,
     Ask,
     Stay,
+    /// Keep the account, wait for its reset, then go on there.
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

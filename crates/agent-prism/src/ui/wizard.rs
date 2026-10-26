@@ -66,7 +66,7 @@ const POLICIES: [(Policy, &str, &str); 4] = [
     ),
 ];
 
-const ON_LIMIT: [(OnLimit, &str, &str); 3] = [
+const ON_LIMIT: [(OnLimit, &str, &str); 4] = [
     (
         OnLimit::Auto,
         "Move on",
@@ -81,6 +81,11 @@ const ON_LIMIT: [(OnLimit, &str, &str); 3] = [
         OnLimit::Stay,
         "Stay",
         "Only tell me; I switch from the menu.",
+    ),
+    (
+        OnLimit::Wait,
+        "Wait",
+        "Keep the account; go on when its limit resets.",
     ),
 ];
 

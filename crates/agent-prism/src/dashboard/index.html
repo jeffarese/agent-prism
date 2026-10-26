@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>agent-prism dashboard</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <img src="/icon.svg" alt="" width="28" height="28">
+      <div>
+        <div class="brand-name">agent-prism</div>
+        <div class="brand-sub">Usage dashboard</div>
+      </div>
+    </div>
+    <nav class="jump" aria-label="Sections">
+      <a href="#now">Now</a>
+      <a href="#history">History</a>
+      <a href="#activity">Activity</a>
+      <a href="#distribution">Distribution</a>
+      <a href="#events">Events</a>
+    </nav>
+    <div class="top-right">
+      <div class="live" id="live" role="status" aria-live="polite"><span class="live-dot"></span><span id="live-text">Connecting…</span></div>
+      <div class="seg" role="group" aria-label="Theme" id="theme">
+        <button type="button" data-theme-set="auto" aria-pressed="true" title="Follow the system">Auto</button>
+        <button type="button" data-theme-set="light" aria-pressed="false">Light</button>
+        <button type="button" data-theme-set="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+  </div>
+  <div class="filters-in">
+    <div class="filters" role="toolbar" aria-label="Filters">
+      <div class="seg" role="group" aria-label="Range" id="range">
+        <button type="button" data-range="24h" aria-pressed="true"><span class="l">Last </span>24 hours</button>
+        <button type="button" data-range="7d" aria-pressed="false"><span class="l">Last </span>7 days</button>
+      </div>
+      <div class="seg" role="group" aria-label="Tool" id="tool" hidden>
+        <button type="button" data-tool="all" aria-pressed="true">All<span class="l"> tools</span></button>
+        <button type="button" data-tool="claude" aria-pressed="false">Claude</button>
+        <button type="button" data-tool="codex" aria-pressed="false">Codex</button>
+      </div>
+      <div class="filters-note" id="policy"></div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <section id="now" aria-labelledby="now-h">
+    <h2 id="now-h" class="vh">Now</h2>
+    <div class="kpis" id="kpis"></div>
+    <div class="picks" id="picks"></div>
+    <div id="accounts"></div>
+  </section>
+
+  <section id="history" aria-labelledby="history-h">
+    <div class="sec-head">
+      <h2 id="history-h">Usage history</h2>
+      <p class="sec-sub">Utilization of each account's limit windows, sampled whenever agent-prism polls. Gaps mean nothing polled then.</p>
+    </div>
+    <div class="card" id="history-card"></div>
+  </section>
+
+  <section id="activity" aria-labelledby="activity-h">
+    <div class="sec-head">
+      <h2 id="activity-h">Account timeline</h2>
+      <p class="sec-sub">Each bar is a run on an account. Lines join the two ends of a switch; red marks are limit hits.</p>
+    </div>
+    <div class="card" id="timeline-card"></div>
+  </section>
+
+  <section id="distribution" aria-labelledby="dist-h">
+    <div class="sec-head">
+      <h2 id="dist-h">Distribution</h2>
+      <p class="sec-sub" id="dist-sub">How runs, time and tokens spread over accounts, projects, modes and models.</p>
+    </div>
+    <div class="grid-dist" id="dist"></div>
+  </section>
+
+  <section id="events" aria-labelledby="events-h">
+    <div class="sec-head">
+      <h2 id="events-h">Events and runs</h2>
+    </div>
+    <div class="grid-events">
+      <div class="card" id="feed-card"></div>
+      <div class="card" id="runs-card"></div>
+    </div>
+  </section>
+  <footer class="foot" id="foot"></footer>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body>
+</html>

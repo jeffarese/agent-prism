@@ -13,6 +13,7 @@ mod adopt_cmd;
 mod app;
 mod cli;
 mod codex;
+mod dashboard;
 mod doctor;
 mod hooks;
 mod host;
@@ -20,7 +21,9 @@ mod launch;
 mod live;
 mod logging;
 mod session;
+mod skill;
 mod status;
+mod supervise;
 mod tokens;
 mod transcript;
 mod ui;
@@ -72,6 +75,8 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         Command::Pick { json, tool } => status::run_pick(ctx, json, tool),
         Command::Settings => ui::run_settings(ctx).map(|()| 0),
         Command::Setup => ui::run_onboarding(ctx).map(|_| 0),
+        Command::Dashboard { port, open } => dashboard::run(ctx, port, open),
+        Command::Skill { install } => skill::run(&ctx, install),
         Command::Add { id, tool } => ui::run_add(ctx, id, tool).map(|()| 0),
         Command::Doctor => doctor::run(ctx),
         Command::Adopt {

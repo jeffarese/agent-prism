@@ -52,6 +52,7 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
     }
     println!("state      {}", ctx.paths.state_dir.display());
     let now = unix_now();
+    let claude = config.profiles_for(&ctx.paths, Tool::Claude);
     for p in profiles {
         let common = &p.common_home;
         let rules = config.share_rules(p.tool);
@@ -87,7 +88,19 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
             id.org.as_deref().unwrap_or("—")
         );
         match p.tool {
-            Tool::Claude => println!("  keychain {}", p.keychain_service()),
+            Tool::Claude => {
+                println!("  keychain {}", p.keychain_service());
+                if let Some((own, missing)) = prism_core::trust::status(&ctx.paths, &p, &claude) {
+                    println!(
+                        "  trust    {own} folder(s) · {missing} trusted on other accounts only{}",
+                        if missing > 0 && config.share.sync_trust {
+                            " (added at next start)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             Tool::Codex => {
                 let auth = p.codex_auth_path();
                 if let Ok(prism_core::codex::CodexLogin::ApiKey) =

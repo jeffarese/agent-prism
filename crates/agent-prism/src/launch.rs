@@ -155,6 +155,26 @@ pub fn strip_for_switch(args: &[String]) -> Vec<String> {
     out
 }
 
+/// The args for a print-mode resume: [`strip_for_switch`] and also every
+/// other positional (the prompt can sit anywhere among the flags of
+/// `claude -p`).
+pub fn strip_positionals(args: &[String]) -> Vec<String> {
+    let args = strip_for_switch(args);
+    let mut out = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with('-') {
+            continue;
+        }
+        let takes = !a.contains('=') && VALUE_FLAGS.contains(&a.as_str());
+        out.push(a);
+        if takes && let Some(v) = it.next() {
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Splits off the user's `--settings` (value) from the args.
 pub fn take_user_settings(args: &[String]) -> (Vec<String>, Option<String>) {
     let mut rest = Vec::new();
@@ -473,6 +493,12 @@ impl SpecBuilder {
         );
         if profile.tool == Tool::Codex {
             return Ok(self.build_codex(config, profile, start));
+        }
+        // Right before the spawn, so Claude on this account has little time
+        // to rewrite the file in between (§4.7).
+        if config.share.sync_trust {
+            let claude = config.profiles_for(&self.paths, Tool::Claude);
+            prism_core::trust::sync(&self.paths, profile, &claude);
         }
         let overlay_path = self.paths.profile_overlay(&profile.id);
         let overlay = match std::fs::read_to_string(&overlay_path) {
@@ -905,6 +931,25 @@ mod tests {
     }
 
     #[test]
+    fn strip_all_positionals() {
+        assert_eq!(
+            strip_positionals(&v(&[
+                "-p",
+                "the prompt",
+                "--model",
+                "opus",
+                "--output-format=json",
+                "-r",
+                "old",
+                "--verbose",
+                "--",
+                "x"
+            ])),
+            v(&["-p", "--model", "opus", "--output-format=json", "--verbose"])
+        );
+    }
+
+    #[test]
     fn strip_prompt_and_session() {
         assert_eq!(
             strip_for_switch(&v(&["--model", "opus", "fix the bug"])),
@@ -1045,6 +1090,35 @@ mod tests {
             .unwrap();
         assert!(get(&spec, "CLAUDE_CONFIG_DIR").is_none());
         assert_eq!(spec.env_remove, vec![OsString::from("CLAUDE_CONFIG_DIR")]);
+    }
+
+    #[test]
+    fn spec_syncs_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = builder(dir.path(), &[]);
+        let mut cfg = Config::default();
+        for id in ["a", "b"] {
+            cfg.profiles.push(prism_core::config::ProfileConfig {
+                id: id.into(),
+                dir: format!("~/.claude-{id}"),
+                ..Default::default()
+            });
+        }
+        let ps = cfg.profiles_for(&b.paths, Tool::Claude);
+        for (p, v) in ps.iter().zip([
+            serde_json::json!({"projects": {"/w": {"hasTrustDialogAccepted": true}}}),
+            serde_json::json!({"projects": {}}),
+        ]) {
+            std::fs::create_dir_all(&p.dir).unwrap();
+            std::fs::write(p.claude_json_path(&b.paths), v.to_string()).unwrap();
+        }
+        let trusted = || prism_core::trust::status(&b.paths, &ps[1], &ps).map(|(own, _)| own);
+        cfg.share.sync_trust = false;
+        b.build(&cfg, &ps[1], &Start::Fresh).unwrap();
+        assert_eq!(trusted(), Some(0));
+        cfg.share.sync_trust = true;
+        b.build(&cfg, &ps[1], &Start::Fresh).unwrap();
+        assert_eq!(trusted(), Some(1));
     }
 
     #[test]

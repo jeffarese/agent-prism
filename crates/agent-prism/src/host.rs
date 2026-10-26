@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::SystemTime;
 
 use prism_core::config::{Config, DockShow};
+use prism_core::journal::{EventKind, Recorder};
 use prism_core::model::{
     AccountView, Countdown, DockMode, DockModel, LimitKind, MessageLevel, OnLimit, Policy,
     Projection, StatusMessage, Tool,
@@ -23,6 +24,7 @@ use serde_json::Value;
 
 use crate::actions::UiAction;
 use crate::app::AppCtx;
+use crate::cli::RunOptions;
 use crate::launch::{self, SpecBuilder, Start, unix_now};
 use crate::live::{Live, PendingSwitch, SessionInfo};
 use crate::tokens::KeychainTokens;
@@ -37,6 +39,11 @@ const CHECK_SECS: i64 = 2;
 const INPUTS_SECS: i64 = 30;
 /// How often a Codex session looks for its thread id in the database.
 const CODEX_THREAD_SECS: i64 = 3;
+/// A wait goes on this long after the reset time, so the reset has
+/// happened when the session goes on.
+const WAIT_GRACE_SECS: i64 = 30;
+/// A wait with no known reset time checks the usage again after this long.
+const WAIT_RECHECK_SECS: i64 = 300;
 
 /// Events from agent-prism's own threads into the runner.
 #[derive(Clone, Debug)]
@@ -53,6 +60,8 @@ enum PendingKind {
     Auto,
     /// Wait for the user (menu → switch now / ConfirmSwitch).
     Ask,
+    /// Stay on the account until its reset (the deadline), then go on.
+    Wait,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +96,10 @@ pub struct HostInit {
     pub active: String,
     pub session_id: Option<String>,
     pub poller: Option<PollerHandle>,
+    /// Per-run options; applied again on every config reload.
+    pub run: RunOptions,
+    /// The run journal of this session.
+    pub journal: Recorder,
 }
 
 /// A Codex session finds its thread id in Codex's database: the newest
@@ -132,6 +145,8 @@ pub struct SessionHost {
     limit_episode: bool,
     switched: Option<Switched>,
     poller: Option<PollerHandle>,
+    run: RunOptions,
+    journal: Recorder,
     last_check: i64,
     last_inputs: i64,
     last_draw: i64,
@@ -141,6 +156,16 @@ pub struct SessionHost {
 
 fn mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// The journal code of a limit window.
+fn limit_code(kind: LimitKind) -> String {
+    match kind {
+        LimitKind::FiveHour => "5h",
+        LimitKind::SevenDay => "7d",
+        LimitKind::Scoped => "scoped",
+    }
+    .into()
 }
 
 fn window_name(kind: LimitKind) -> &'static str {
@@ -197,6 +222,8 @@ impl SessionHost {
             active: init.active,
             session_id: init.session_id,
             poller: init.poller,
+            run: init.run,
+            journal: init.journal,
         };
         h.refresh_inputs();
         h.reload_usage_from_disk();
@@ -290,6 +317,11 @@ impl SessionHost {
         })
     }
 
+    /// The account and session id at the end, for the journal.
+    pub fn journal_end(&self) -> (String, Option<String>) {
+        (self.active.clone(), self.session_id.clone())
+    }
+
     /// Writes this session's registry record.
     pub fn write_registry(&self) {
         let rec = SessionRecord {
@@ -332,14 +364,18 @@ impl SessionHost {
             pending: None,
         };
         let views = self.views();
-        let pending = self.pending.as_ref().map(|p| PendingSwitch {
-            target_id: p.target.clone(),
-            target_label: views
-                .iter()
-                .find(|v| v.profile_id == p.target)
-                .map_or_else(|| p.target.clone(), |v| v.label.clone()),
-            reason: p.reason.clone(),
-        });
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|p| p.kind != PendingKind::Wait)
+            .map(|p| PendingSwitch {
+                target_id: p.target.clone(),
+                target_label: views
+                    .iter()
+                    .find(|v| v.profile_id == p.target)
+                    .map_or_else(|| p.target.clone(), |v| v.label.clone()),
+                reason: p.reason.clone(),
+            });
         let session = SessionInfo { pending, ..session };
         let pick = self.pick_other();
         let mut d = self.live.lock();
@@ -369,6 +405,10 @@ impl SessionHost {
                 return;
             }
         };
+        let mut config = config;
+        if let Err(e) = self.run.apply(&mut config, self.tool) {
+            log::warn!("run options after config reload: {e:#}");
+        }
         if config.dock.mode != self.config.dock.mode {
             self.dock_mode = config.dock.mode;
             ctl.set_dock_mode(self.dock_mode);
@@ -393,6 +433,16 @@ impl SessionHost {
         self.limit_episode = true;
         let label = self.label(&self.active);
         let what = kind.map_or("usage", window_name);
+        let mut ev = self
+            .journal
+            .event(EventKind::Limit, &self.active, self.now());
+        ev.limit = kind.map(limit_code);
+        ev.session = self.session_id.clone();
+        self.journal.write(ev);
+        if self.config.balance.on_limit == OnLimit::Wait {
+            self.start_wait(format!("hit the {what} limit"), interrupted);
+            return;
+        }
         let pick = self.pick_other();
         let Some(target) = pick.chosen else {
             let now = self.now();
@@ -434,6 +484,89 @@ impl SessionHost {
                 );
             }
             OnLimit::Stay => self.set_message(MessageLevel::Warn, format!("{label} {reason}")),
+            OnLimit::Wait => unreachable!("handled above"),
+        }
+    }
+
+    /// When the active account's limit resets, if known.
+    fn active_reset(&self) -> Option<i64> {
+        self.views()
+            .into_iter()
+            .find(|v| v.profile_id == self.active)
+            .and_then(|v| v.limited.and_then(|l| l.until))
+    }
+
+    /// `on_limit = wait`: stay on the account until its reset, then go on
+    /// (DESIGN §9). A reset further away than `--max-wait` is only reported.
+    fn start_wait(&mut self, reason: String, interrupted: bool) {
+        let now = self.now();
+        let label = self.label(&self.active);
+        let until = self.active_reset();
+        let deadline = until.map_or(now + WAIT_RECHECK_SECS, |t| t.max(now) + WAIT_GRACE_SECS);
+        if let Some(max) = self.run.max_wait
+            && deadline - now > max
+        {
+            self.set_message(
+                MessageLevel::Warn,
+                format!(
+                    "{label} {reason} · resets in {}, longer than --max-wait",
+                    fmt_duration(deadline - now)
+                ),
+            );
+            return;
+        }
+        log::info!("{label} {reason}; waiting until {deadline}");
+        let mut ev = self.journal.event(EventKind::Wait, &self.active, now);
+        ev.until = until;
+        ev.session = self.session_id.clone();
+        self.journal.write(ev);
+        self.pending = Some(Pending {
+            target: self.active.clone(),
+            kind: PendingKind::Wait,
+            deadline,
+            reason,
+            interrupted,
+        });
+    }
+
+    /// The wait `p` is over: go on on the same account, with the resume
+    /// prompt when Claude has work to carry on, else only a message.
+    fn finish_wait(&mut self, p: Pending, ctl: &mut Control<UiAction>) {
+        let now = self.now();
+        self.pending = None;
+        // Still limited with a later reset (a fresh poll): wait again.
+        if self
+            .active_reset()
+            .is_some_and(|t| t + WAIT_GRACE_SECS > now)
+        {
+            self.start_wait(p.reason, p.interrupted);
+            return;
+        }
+        self.limit_episode = false;
+        let label = self.label(&self.active);
+        let mut ev = self.journal.event(EventKind::Resume, &self.active, now);
+        ev.session = self.session_id.clone();
+        self.journal.write(ev);
+        let prompt = self.limit_prompt(&p);
+        let (Some(prompt), Some(sid)) = (prompt, self.session_id.clone()) else {
+            self.set_message(MessageLevel::Info, format!("{label} reset · go on"));
+            return;
+        };
+        let Some(profile) = self.profile(&self.active).cloned() else {
+            return;
+        };
+        let start = Start::Resume {
+            session_id: sid,
+            prompt: Some(prompt),
+        };
+        match self.builder.build(&self.config, &profile, &start) {
+            Ok((spec, _)) => {
+                ctl.restart_child(spec);
+                self.restart_codex_watch(now);
+                self.busy = false;
+                self.set_message(MessageLevel::Info, format!("{label} reset · going on"));
+            }
+            Err(e) => self.set_message(MessageLevel::Error, format!("resume failed: {e:#}")),
         }
     }
 
@@ -470,13 +603,20 @@ impl SessionHost {
                 return None;
             }
         }
+        let moved = if p.kind == PendingKind::Wait {
+            "agent-prism waited for the reset on the same account".to_string()
+        } else {
+            format!(
+                "this conversation moved to account {}",
+                self.label(&p.target)
+            )
+        };
         Some(format!(
-            "[agent-prism] Account {} {}, so this conversation moved to account {} \
+            "[agent-prism] Account {} {}, so {moved} \
              and `{}` restarted. Background tasks and subagents that ran in the old \
              process have stopped; start again the ones you still need.\n\n{resume}",
             self.label(&self.active),
             p.reason,
-            self.label(&p.target),
             self.tool.bin(),
         ))
     }
@@ -489,6 +629,7 @@ impl SessionHost {
         prompt: Option<String>,
         ctl: &mut Control<UiAction>,
     ) -> bool {
+        let start_is_limit = self.limit_episode;
         self.pending = None;
         if target == self.active {
             return false;
@@ -524,6 +665,11 @@ impl SessionHost {
         ctl.restart_child(spec);
         let now = self.now();
         self.restart_codex_watch(now);
+        let mut ev = self.journal.event(EventKind::Switch, target, now);
+        ev.from = Some(self.active.clone());
+        ev.session = Some(sid.clone());
+        ev.reason = Some(if start_is_limit { "limit" } else { "manual" }.into());
+        self.journal.write(ev);
         self.switched = Some(Switched {
             previous: std::mem::replace(&mut self.active, target.to_string()),
             at: now,
@@ -759,6 +905,15 @@ impl SessionHost {
             let (target, prompt) = (p.target.clone(), self.limit_prompt(p));
             self.perform_switch(&target, prompt, ctl);
         }
+        if let Some(p) = &self.pending
+            && p.kind == PendingKind::Wait
+            && now >= p.deadline
+        {
+            let p = p.clone();
+            self.refresh_usage(Some(self.active.clone()));
+            self.finish_wait(p, ctl);
+            ctl.redraw();
+        }
         if now - self.last_check >= CHECK_SECS {
             self.last_check = now;
             if mtime(&self.ctx.paths.config_file()) != self.config_mtime {
@@ -852,6 +1007,19 @@ impl Host<SessionEvent, UiAction> for SessionHost {
                 deadline: p.deadline,
             })
         });
+        let waiting = self
+            .pending
+            .as_ref()
+            .filter(|p| p.kind == PendingKind::Wait)
+            .map(|p| StatusMessage {
+                level: MessageLevel::Warn,
+                text: format!(
+                    "{} {} · waiting for the reset · going on in {} · ⌃\\ menu",
+                    self.label(&self.active),
+                    p.reason,
+                    fmt_duration(p.deadline - now)
+                ),
+            });
         DockModel {
             accounts,
             mode: self.dock_mode,
@@ -862,7 +1030,7 @@ impl Host<SessionEvent, UiAction> for SessionHost {
                 .map(|s| s.chars().take(8).collect()),
             on_account: Some((self.label(&self.active), self.since)),
             usage_age_secs: newest.map(|t| (now - t).max(0)),
-            message: self.message.as_ref().map(|(m, _)| m.clone()),
+            message: waiting.or_else(|| self.message.as_ref().map(|(m, _)| m.clone())),
             countdown,
             menu_key_label: "⌃\\".into(),
             show_projections: self.config.dock.projections,
@@ -994,6 +1162,13 @@ mod tests {
             active: "a".into(),
             session_id: None,
             poller: None,
+            run: RunOptions::default(),
+            journal: Recorder::new(
+                paths.clone(),
+                Tool::Claude,
+                prism_core::journal::RunMode::Tui,
+                0,
+            ),
         });
         Fixture {
             b_dir: root.join("p-b"),
@@ -1112,6 +1287,78 @@ mod tests {
 
     /// The config file goes away mid-session (e.g. a rename moved it):
     /// the accounts stay, so a limit still switches.
+    #[test]
+    fn wait_stays_then_resumes_on_the_same_account() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Wait);
+        let reset = f.host.active_reset().expect("reset time");
+        hook(
+            &mut f.host,
+            "SessionStart",
+            serde_json::json!({"session_id":"sess-1234567"}),
+        );
+        let mut ctl = hook(
+            &mut f.host,
+            "StopFailure",
+            serde_json::json!({"error":"rate_limit"}),
+        );
+        assert!(ctl.take_restart().is_none());
+        let m = f.host.dock_model();
+        assert!(m.countdown.is_none());
+        let text = m.message.expect("wait message").text;
+        assert!(
+            text.starts_with("Acct A hit the 5h limit · waiting for the reset"),
+            "{text}"
+        );
+        // The menu does not offer a switch to the same account.
+        assert!(
+            f.host
+                .live
+                .lock()
+                .session
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_none()
+        );
+        let mut ctl = Control::default();
+        f.host.test_now = Some(reset + 1);
+        f.host.on_event(HostEvent::Tick, &mut ctl);
+        assert!(ctl.take_restart().is_none(), "grace period first");
+        // After the reset (+ grace): restart on a with --resume and a prompt.
+        f.host.test_now = Some(reset + WAIT_GRACE_SECS + 1);
+        f.host.on_event(HostEvent::Tick, &mut ctl);
+        let spec = ctl.take_restart().expect("resume");
+        let a = args(&spec);
+        assert_eq!(a[a.len() - 3..a.len() - 1], ["--resume", "sess-1234567"]);
+        assert!(
+            a[a.len() - 1].contains("waited for the reset on the same account"),
+            "{}",
+            a[a.len() - 1]
+        );
+        assert_eq!(env(&spec, "AGP_PROFILE").unwrap(), "a");
+        assert_eq!(f.host.active, "a");
+        assert!(f.host.pending.is_none());
+    }
+
+    #[test]
+    fn wait_longer_than_max_wait_only_tells() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Wait);
+        f.host.run.max_wait = Some(60);
+        hook(
+            &mut f.host,
+            "SessionStart",
+            serde_json::json!({"session_id":"s"}),
+        );
+        hook(
+            &mut f.host,
+            "StopFailure",
+            serde_json::json!({"error":"rate_limit"}),
+        );
+        assert!(f.host.pending.is_none());
+        let text = f.host.dock_model().message.unwrap().text;
+        assert!(text.contains("longer than --max-wait"), "{text}");
+    }
+
     #[test]
     fn missing_config_keeps_accounts() {
         let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);

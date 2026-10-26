@@ -55,6 +55,7 @@ fn classify_classes() {
         extra: ShareConfig {
             extra_shared: vec!["scheduled".into(), "projects".into()],
             extra_local: vec!["projects".into(), "my-*".into()],
+            ..Default::default()
         },
     };
     assert_eq!(classify("scheduled", &c), ShareClass::Shared);
@@ -321,7 +322,7 @@ fn plan_apply_replan() {
         a => panic!("{a:?}"),
     }
     match find(&plan, "settings.json") {
-        Action::Merge { preview, .. } => assert_eq!(preview.overlay_keys, vec!["env", "model"]),
+        Action::Merge { preview, .. } => assert_eq!(preview.overlay_keys, vec!["model", "env"]),
         a => panic!("{a:?}"),
     }
     assert!(

@@ -42,6 +42,7 @@ proxy setup) is never offered as an account.
 | Per-run files | `<state>/run/<pid>/` (hook settings, socket `ctl.sock`) | |
 | Log | `<state>/agent-prism.log` (rotated at 2 MB) | `AGP_LOG=debug` |
 | Adopt journals | `<state>/adopt/<ts>-<profile>.json` | |
+| Run journal | `<state>/runs.jsonl` (cut to its newest half at 8 MB) | |
 
 All path defaults are computed in one place (`prism_core::paths`). Library
 functions take paths as parameters so that tests use temp dirs. Tests must
@@ -67,7 +68,7 @@ args = []                # extra args for every `agp codex` launch
 
 [balance]
 policy = "smart"         # smart | priority | round-robin | headroom
-on_limit = "auto"        # auto | ask | stay
+on_limit = "auto"        # auto | ask | stay | wait
 countdown_secs = 5
 resume_prompt = "continue"   # first prompt after a limit switch when Claude has work (§9); "" = none
 soft_5h = 90             # new sessions avoid an account at/over this 5h %
@@ -105,6 +106,7 @@ env = {}                 # extra env for this profile
 [share]
 extra_shared = []        # entry names to add to the shared set
 extra_local = []         # entry names to force local
+sync_trust = true        # give every Claude account the folder trust of the others (§4.7)
 ```
 
 `dir` is stored with `~`; it is expanded to an absolute path with no trailing
@@ -224,6 +226,44 @@ Name: `<YYYY-MM-DD>-<profile>-<HHMMSS>.tar.gz`.
    `CLAUDE_CONFIG_DIR=<dir> claude auth login` attached to the terminal.
    Return to the TUI after it exits.
 4. Read identity (§4.1). Show it. Add `[[profile]]` with `pool = true`.
+
+### 4.7 Folder trust
+
+Claude keeps "trust this folder" in the account's `.claude.json` (§4.1), at
+`projects["<abs path>"].hasTrustDialogAccepted`; no other field marks trust.
+Claude also counts a trusted parent dir; inside a git repo it looks only up
+to the repo root (Claude 2.1.310). Codex keeps trust in `config.toml`
+(`[projects."<path>"] trust_level`), which all Codex accounts share (§12), so
+it needs nothing.
+
+Before Claude starts on an account (first start and every switch; not print
+mode, which shows no dialog), `prism_core::trust::sync` gives that account
+the trust of every folder that another Claude account trusts (the union).
+It only adds trust; it never removes it.
+
+- Existing entry: only `hasTrustDialogAccepted` becomes `true`; its other
+  fields stay. No entry: Claude's own default entry (`allowedTools: []`,
+  `mcpServers: {}` … the entry Claude writes when the dialog is accepted in a
+  new folder) with trust on, at the end of `projects`. Other accounts'
+  `allowedTools`, MCP approvals and stats are not copied.
+- The write keeps the rest of the file as it is: key order
+  (`serde_json` `preserve_order`), numbers (`float_roundtrip`) and Claude's
+  2-space format. Temp file + rename in the same dir, through a symlinked
+  file. No write when nothing changes.
+- A missing target file (a new login) is left to Claude. A file that is
+  unreadable or not JSON is skipped with a warning in the log; the launch
+  never fails because of the sync.
+- Race: a Claude already running on that account can write the file at the
+  same time. agent-prism takes Claude's own lock (the dir
+  `<.claude.json>.lock`, proper-lockfile; a lock older than 10 s is stale) for
+  its read-modify-write, and Claude re-reads the file under that lock before
+  it writes, so neither side loses the other's change. If the lock is held for
+  more than 1 s, the sync skips this start. A Claude version that writes
+  without the lock could still overwrite the change; the next start adds it
+  again.
+
+`share.sync_trust = false` turns it off. `doctor` shows, per Claude account,
+how many folders it trusts and how many only other accounts trust.
 
 ## 5. Shared data model (`prism_core::model`)
 
@@ -395,6 +435,8 @@ Throttle draws to ≤ 20/s; draw within one frame after output goes quiet
   the earliest-reset account. Overlay and user `--settings` are merged into
   one JSON value (user wins); if that fails the user value goes through. Same
   inside an agent-prism session (nested).
+- Print mode with `--on-limit` (§11a): agent-prism stays the parent
+  (`supervise.rs`) instead of exec'ing the tool.
 - Exit: when the child exits (not by an agent-prism switch), restore the terminal
   (`CSI r`, show cursor, clear the dock rows, leave raw mode) and exit with
   the child's code.
@@ -489,8 +531,16 @@ user ("Switch account now" in the menu, pick a target or "best").
 1. Target = balancer pick excluding the current account (or the user's).
    None → status message with the earliest reset; stop.
 2. `on_limit`: `auto` → countdown (`countdown_secs`; ⏎ now, Esc cancel);
-   `ask` → prompt in the status row; `stay` → message only. Manual switch →
-   no countdown.
+   `ask` → prompt in the status row; `stay` → message only; `wait` → no
+   target: stay on the account until its reset + 30 s (unknown reset: check
+   again in 5 min), with "waiting for the reset · going on in …" in the
+   status row; the menu still offers a manual switch. At the deadline, if
+   the account is still limited with a later reset, wait again; else go on:
+   with work to carry on (same rule as step 5) restart the tool on the same
+   account with `--resume` and the resume prompt ("agent-prism waited for
+   the reset on the same account"), otherwise only a message. A reset
+   further away than `--max-wait` → message only. Manual switch → no
+   countdown.
 3. If `busy` and the trigger is manual, confirm first ("Claude is working").
 4. SIGTERM to the child's process group; wait ≤ 3 s; SIGKILL.
 5. Spawn on the target with the same cwd and args, minus the user's session
@@ -558,6 +608,8 @@ agp status [--json] [--watch]
 agp pick [--json] [--codex]
 agp add [--codex | --claude] [id]
 agp settings | setup | doctor
+agp dashboard [--port <n>] [--no-open]
+agp skill [install]             print or install the agp skill (§11a)
 agp adopt <id|dir> [--apply] [--no-backup] [--force]
 agp exec <id> -- <cmd...>       run a command with that profile's env
 agp hook <Event>                internal
@@ -571,6 +623,120 @@ Inside an agent-prism session (`AGP_SOCK` set and its socket accepts a connectio
 interactive `agp` warns and execs plain claude. A dead socket is an `AGP_SOCK` left in a
 multiplexer (herdr, tmux) started from a session that has since exited, so `agp` starts a
 full session there.
+
+## 11a. Per-run options and supervised print mode
+
+Launch flags (a leading prefix, like `--as`): `--on-limit
+<switch|ask|stay|wait|fail>`, `--max-wait <dur>`, `--accounts <ids>`,
+`--exclude <ids>`, `--max-usage <pct>`. `RunOptions::apply` changes the
+loaded config in memory for this run only: `--accounts` sets `pool` to
+membership (out-of-pool accounts can be listed), `--exclude` clears `pool`,
+`--max-usage` lowers `balance.hard` and `soft_5h` to the percent, and
+`--on-limit` (all but `fail`) sets `balance.on_limit`. A session applies
+them again after every config reload. Unknown ids are an error. `fail` in
+an interactive session is an error.
+
+Print mode with `--on-limit` (`agp -p`, `agp codex exec`, any direct codex
+line): agent-prism spawns the tool as a child instead of exec. Claude gets
+the usual print settings plus the hooks (§8) on a socket of the run (a
+per-user temp path when `<run>/ctl.sock` is longer than 103 bytes).
+
+1. Pick: `--as`, else the balancer. Nothing usable (or the `--as` account
+   is limited): `wait` → sleep until the earliest reset + 30 s, waking every
+   5 min to see if the account is free; `fail` → exit 75; else run on the
+   account that resets first, as plain print mode does.
+2. Run the attempt. stdin is inherited by the first attempt only; stdout is
+   buffered unless it streams (`--output-format stream-json`, codex
+   `--json`); stderr passes through. Signals go to the child.
+3. Limit: a `StopFailure` with `rate_limit`, or a non-zero exit while the
+   account (usage refreshed) is limited. Codex has no hooks: only the
+   second test. Else write the buffered stdout and exit with the code.
+4. On a limit: `stay` → exit with the code; `fail` → 75; `wait` → sleep
+   until the account's reset (+ 30 s), then resume on it; `switch`/`ask` →
+   resume on the best other account (none → exit with the code). Waits
+   together are capped by `--max-wait` (over it → 75). At most 20
+   recoveries per run. Resume: Claude `--resume <session id from
+   SessionStart>` with every positional removed from the user args and the
+   resume prompt (§9, "this run moved to account …") as the prompt; Codex
+   (`exec` lines only) `exec <user flags> resume <thread id> <prompt>`, the
+   thread being the newest one in the work dir since the attempt started
+   (any `thread_source`). No session id → exit with the code.
+
+## 11b. Run journal
+
+`<state>/runs.jsonl` (`prism_core::journal`): one JSON line per event of a
+run, for `agp dashboard`: `ts`, `run` (`<pid>-<start ts>`), `ev`
+(`start | limit | wait | switch | resume | end`), `tool`, `mode` (`tui` =
+session, `exec` = print mode that replaced itself, so no `end`, `print` =
+supervised print mode), `profile`, and when they apply `from`, `limit`
+(`5h | 7d | scoped`), `until`, `reason`, `session`, `cwd`, `exit`, `secs`.
+A line is one `write` in append mode, so processes don't interleave. Errors
+are logged and never fail a run.
+
+## 11c. Dashboard (`agp dashboard`)
+
+Code: `crates/agent-prism/src/dashboard.rs` and `dashboard/` (the page is
+`index.html`, `app.css`, `app.js`, embedded with `include_str!`).
+
+**Server.** `std::net::TcpListener` on `127.0.0.1:<port>` (0 = any free
+port), a thread per connection (at most 32), one request per connection.
+Only `GET`. The `Host` header must be `127.0.0.1:<port>` or
+`localhost:<port>` (DNS rebinding), and a request with `Sec-Fetch-Site:
+cross-site | same-site` is refused. No CORS headers. The page has a strict
+CSP (`default-src 'none'`, scripts and styles from the server only, so no
+inline script or style; the JS sets styles through CSSOM). SIGINT and
+SIGTERM set a flag; the accept loop polls it and stops.
+
+**Endpoints.** `/api/state`: the same calls as `agp status --json`
+(`account_inputs`, `load_usage`, `projections`, `build_views`, the pick
+per tool), mapped to a dashboard shape: identity, plan and tier, token
+state as a word (`valid | expired | missing | unreadable`; the text of a
+read error is never sent), windows with projections, scoped windows,
+limited, pick and reason, live sessions, the color slot.
+`/api/history?range=24h|7d`: the usage samples per account in buckets of
+5 min (24 h) or 30 min (7 d), with the peak of each window per bucket.
+`/api/activity?range=…&tool=claude|codex`: runs rebuilt from the journal
+(3 days of slack before the range so that long runs keep their start) and
+summarized for the range.
+
+**Runs.** The events of a run id, in time order, give segments: the
+account from the start, a new segment at each switch, a waiting segment
+from `wait` to `resume`. A run without `end` is live when the registry has
+its pid (with `started_at` within 2 min of the start; it then ends now);
+else it ends at its last event. Run time counts only the non-waiting part
+of segments inside the range.
+
+**Tokens.** Only the sessions that the journal names are read. Claude:
+`<common>/projects/<slug>/<session>.jsonl` plus `<session>/subagents/*.jsonl`
+(slug = cwd with every non-alphanumeric char as `-`; else every project
+dir is checked for the file). Assistant lines with `message.usage`;
+streamed chunks repeat `message.id`, and the last one wins. Codex: the
+rollout file of the thread under `<codex common>/sessions/YYYY/MM/DD/`
+(an index of all rollout names, rebuilt at most every 5 min); a
+`token_count` event counts its `last_token_usage` when
+`total_token_usage.total_tokens` grew (repeated events don't count), with
+the model from the last `turn_context`. Files are parsed incrementally
+(they only grow: parse from the last full line) and cached by path. A
+record belongs to the run of its session whose window holds its time
+(start to end; an `exec` run without an end: until the next run of the
+session, at most 24 h) and to the account active then. An `exec` run ends
+at its last record.
+
+**Freshness.** A thread calls `launch::refresh_stale` for every account
+every `usage.poll_idle_secs` (the per-profile lock and backoff make it
+cooperate with running sessions; `AGP_NO_POLL=1` turns it off). The config
+is reloaded when its mtime changes. The page polls `/api/state` every 5 s
+and the other endpoints every 30 s and on a filter change.
+
+**Page.** Colors are roles: a validated 8-slot categorical palette (light
+and dark steps), status colors only for state (meters: < 60 good, < 85
+warning, else critical, as in the dock), a one-hue ramp for the heatmap.
+An account keeps its color slot everywhere: its config `color` when that
+slot is free (`cyan` → aqua, `blue`, `yellow`, `magenta`, `green`, `red`),
+else the first free slot in config order; past 8 accounts, gray. Every
+chart has a tooltip on hover and keyboard focus; the history and timeline
+charts have a table view; the legend hides an account (⌥-click: only
+that one).
 
 ## 12. Codex (ChatGPT plans)
 
