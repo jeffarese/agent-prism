@@ -726,7 +726,7 @@ agp status [--json] [--watch]    RUNS per account, room left; JSON: views[].runs
 agp pick [--json] [--codex] [--n <k>]   --n: where k new runs would go (nothing claimed)
 agp add [--codex | --claude] [id]
 agp settings | setup | doctor
-agp dashboard [--port <n>] [--no-open]
+agp dashboard [--port <n>] [--no-open] [--allow-host <name>]
 agp skill [show]                print the agp skill (SKILL.md; §11e)
 agp skill install [--agent <a>] [--dir <path>]
 agp skill list | uninstall [--agent <a>] [--dir <path>]
@@ -817,8 +817,10 @@ Code: `crates/agent-prism/src/dashboard.rs` and `dashboard/` (the page is
 **Server.** `std::net::TcpListener` on `127.0.0.1:<port>` (0 = any free
 port), a thread per connection (at most 32), one request per connection.
 Only `GET`. The `Host` header must be `127.0.0.1:<port>` or
-`localhost:<port>` (DNS rebinding), and a request with `Sec-Fetch-Site:
-cross-site | same-site` is refused. No CORS headers. The page has a strict
+`localhost:<port>` (DNS rebinding), or a name given with `--allow-host`,
+with or without a port (what a reverse proxy such as `tailscale serve`
+forwards), and a request with `Sec-Fetch-Site: cross-site | same-site` is
+refused. No CORS headers. The page has a strict
 CSP (`default-src 'none'`, scripts and styles from the server only, so no
 inline script or style; the JS sets styles through CSSOM). SIGINT and
 SIGTERM set a flag; the accept loop polls it and stops.

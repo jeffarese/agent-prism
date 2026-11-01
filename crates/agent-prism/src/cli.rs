@@ -144,10 +144,11 @@ pub enum Command {
     },
     Settings,
     Setup,
-    /// `agp dashboard [--port <n>] [--no-open]`: the local web dashboard.
+    /// `agp dashboard [--port <n>] [--no-open] [--allow-host <name>]`: the local web dashboard.
     Dashboard {
         port: Option<u16>,
         open: bool,
+        allow_hosts: Vec<String>,
     },
     /// `agp skill [show | install | list | uninstall]`: the agp skill for
     /// agents (§11e). The field keeps its old name so `main.rs` matches it
@@ -233,7 +234,7 @@ Usage:
                                       the account a new session would use; --n: the
                                       next k runs, each counting the ones before
   agp settings                      settings (full screen)
-  agp dashboard [--port <n>] [--no-open]
+  agp dashboard [--port <n>] [--no-open] [--allow-host <name>]
                                       usage dashboard in the browser
   agp skill [show]                  print the agp skill for agents (SKILL.md)
   agp skill install [--agent <a>] [--dir <path>]
@@ -380,6 +381,15 @@ fn parse_port(v: Option<String>) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("--port needs a port number"))
 }
 
+/// An `--allow-host` value: a bare host name (no scheme, port or path),
+/// lowercased, since the dashboard compares it with the `Host` header.
+fn parse_host(v: Option<String>) -> Result<String> {
+    match v {
+        Some(h) if !h.is_empty() && !h.contains([':', '/', ' ']) => Ok(h.to_ascii_lowercase()),
+        _ => bail!("--allow-host needs a host name, such as box.example.ts.net"),
+    }
+}
+
 /// Parses agent-prism's arguments (without the program name).
 pub fn parse(args: &[OsString]) -> Result<Command> {
     let args: Vec<String> = args.iter().map(s).collect::<Result<_>>()?;
@@ -456,6 +466,7 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
         "dashboard" => {
             let mut port = None;
             let mut open = true;
+            let mut allow_hosts = Vec::new();
             let mut it = rest().into_iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -464,10 +475,20 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
                     _ if a.starts_with("--port=") => {
                         port = Some(parse_port(Some(a["--port=".len()..].to_string()))?)
                     }
-                    _ => bail!("usage: agp dashboard [--port <n>] [--no-open]"),
+                    "--allow-host" => allow_hosts.push(parse_host(it.next())?),
+                    _ if a.starts_with("--allow-host=") => {
+                        allow_hosts.push(parse_host(Some(a["--allow-host=".len()..].into()))?)
+                    }
+                    _ => {
+                        bail!("usage: agp dashboard [--port <n>] [--no-open] [--allow-host <name>]")
+                    }
                 }
             }
-            Command::Dashboard { port, open }
+            Command::Dashboard {
+                port,
+                open,
+                allow_hosts,
+            }
         }
         "skill" => Command::Skill {
             install: parse_skill(&args[1..])?,
@@ -1082,6 +1103,44 @@ mod tests {
             launch(&["skill", "-p", "x"]).tool_args,
             ["skill", "-p", "x"]
         );
+    }
+
+    #[test]
+    fn dashboard_options() {
+        assert_eq!(
+            p(&["dashboard"]),
+            Command::Dashboard {
+                port: None,
+                open: true,
+                allow_hosts: vec![],
+            }
+        );
+        assert_eq!(
+            p(&[
+                "dashboard",
+                "--port",
+                "8787",
+                "--no-open",
+                "--allow-host",
+                "Box.Example.ts.net",
+                "--allow-host=other.ts.net",
+            ]),
+            Command::Dashboard {
+                port: Some(8787),
+                open: false,
+                allow_hosts: vec!["box.example.ts.net".into(), "other.ts.net".into()],
+            }
+        );
+        // A name it could never match: empty, with a port, a scheme or a path.
+        for bad in [
+            &["dashboard", "--allow-host"][..],
+            &["dashboard", "--allow-host="],
+            &["dashboard", "--allow-host", "box.ts.net:443"],
+            &["dashboard", "--allow-host=https://box.ts.net"],
+        ] {
+            let a: Vec<OsString> = bad.iter().map(OsString::from).collect();
+            assert!(parse(&a).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

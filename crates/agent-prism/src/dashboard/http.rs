@@ -82,14 +82,22 @@ pub fn parse_head(head: &str) -> Result<Request> {
     })
 }
 
-/// The Host header names this server: `127.0.0.1:<port>` or
-/// `localhost:<port>`. Anything else may be a DNS-rebinding page.
-pub fn host_ok(host: Option<&str>, port: u16) -> bool {
+/// The Host header names this server: `127.0.0.1:<port>`,
+/// `localhost:<port>`, or one of `allow` (lowercase) bare or with any port,
+/// as a reverse proxy sends it. Anything else may be a DNS-rebinding page.
+pub fn host_ok(host: Option<&str>, port: u16, allow: &[String]) -> bool {
     let Some(h) = host else {
         return false;
     };
     let h = h.to_ascii_lowercase();
-    h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}")
+    if h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}") {
+        return true;
+    }
+    let name = match h.rsplit_once(':') {
+        Some((n, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => n,
+        _ => h.as_str(),
+    };
+    allow.iter().any(|a| a == name)
 }
 
 pub struct Response {

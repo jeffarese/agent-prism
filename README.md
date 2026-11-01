@@ -335,7 +335,15 @@ Token counts come from the Claude transcripts and Codex rollout files of
 the sessions in the journal; agent-prism reads only those files. While the
 dashboard runs, it refreshes the usage of every account every
 `usage.poll_idle_secs`. The page works offline, answers only requests to
-`127.0.0.1` or `localhost`, and never shows a token.
+`127.0.0.1`, `localhost` or an `--allow-host` name, and never shows a token.
+
+To open it from your other devices over Tailscale, put `tailscale serve`
+in front and allow the name it forwards:
+
+```sh
+agp dashboard --port 8787 --no-open --allow-host <host>.<tailnet>.ts.net
+tailscale serve --bg 8787
+```
 
 ## In a session
 

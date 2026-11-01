@@ -81,7 +81,11 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         Command::Nudge { id } => nudge::run(&ctx, &id),
         Command::Settings => ui::run_settings(ctx).map(|()| 0),
         Command::Setup => ui::run_onboarding(ctx).map(|_| 0),
-        Command::Dashboard { port, open } => dashboard::run(ctx, port, open),
+        Command::Dashboard {
+            port,
+            open,
+            allow_hosts,
+        } => dashboard::run(ctx, port, open, allow_hosts),
         Command::Skill { install } => skill::run(&ctx, install),
         Command::Add { id, tool } => ui::run_add(ctx, id, tool).map(|()| 0),
         Command::Doctor => doctor::run(ctx),

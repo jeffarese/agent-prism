@@ -308,12 +308,21 @@ fn http_head_and_host() {
     assert_eq!(r.header("host"), Some("127.0.0.1:4000"));
     assert!(http::parse_head("GET /\r\n").is_err());
     assert!(http::parse_head("GET / SPDY/3").is_err());
-    assert!(http::host_ok(Some("127.0.0.1:4000"), 4000));
-    assert!(http::host_ok(Some("LOCALHOST:4000"), 4000));
-    assert!(!http::host_ok(Some("127.0.0.1:4001"), 4000));
-    assert!(!http::host_ok(Some("evil.example:4000"), 4000));
-    assert!(!http::host_ok(Some("127.0.0.1"), 4000));
-    assert!(!http::host_ok(None, 4000));
+    assert!(http::host_ok(Some("127.0.0.1:4000"), 4000, &[]));
+    assert!(http::host_ok(Some("LOCALHOST:4000"), 4000, &[]));
+    assert!(!http::host_ok(Some("127.0.0.1:4001"), 4000, &[]));
+    assert!(!http::host_ok(Some("evil.example:4000"), 4000, &[]));
+    assert!(!http::host_ok(Some("127.0.0.1"), 4000, &[]));
+    assert!(!http::host_ok(None, 4000, &[]));
+    let ts = ["box.tail1.ts.net".to_string()];
+    assert!(http::host_ok(Some("box.tail1.ts.net"), 4000, &ts));
+    assert!(http::host_ok(Some("Box.tail1.ts.net:443"), 4000, &ts));
+    assert!(!http::host_ok(
+        Some("box.tail1.ts.net.evil.example"),
+        4000,
+        &ts
+    ));
+    assert!(!http::host_ok(Some("evil.example"), 4000, &ts));
     let mut big = b"GET / HTTP/1.1\r\nX: ".to_vec();
     big.extend(std::iter::repeat_n(b'a', 20_000));
     assert!(http::read_request(&mut big.as_slice()).is_err());
@@ -528,6 +537,7 @@ fn fixture(root: &Path) -> Dash {
         scanner: tokens::Scanner::new(&root.join("home/.claude"), &root.join("home/.codex")),
         ctx,
         port: 4000,
+        allow_hosts: Vec::new(),
         config: Mutex::new((None, config, profiles)),
         conns: AtomicUsize::new(0),
         stop: Arc::new(AtomicBool::new(false)),

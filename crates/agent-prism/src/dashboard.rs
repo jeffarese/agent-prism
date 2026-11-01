@@ -54,6 +54,8 @@ const JOURNAL_SLACK_SECS: i64 = 3 * 86_400;
 struct Dash {
     ctx: Arc<AppCtx>,
     port: u16,
+    /// Extra names a reverse proxy (`tailscale serve`) sends in `Host`.
+    allow_hosts: Vec<String>,
     config: Mutex<(Option<SystemTime>, Config, Vec<Profile>)>,
     tokens: Arc<KeychainTokens>,
     scanner: tokens::Scanner,
@@ -82,7 +84,12 @@ impl Dash {
 }
 
 /// Serves the dashboard on 127.0.0.1 until interrupted.
-pub fn run(ctx: Arc<AppCtx>, port: Option<u16>, open: bool) -> Result<i32> {
+pub fn run(
+    ctx: Arc<AppCtx>,
+    port: Option<u16>,
+    open: bool,
+    allow_hosts: Vec<String>,
+) -> Result<i32> {
     let listener = TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
         .with_context(|| format!("binding 127.0.0.1:{}", port.unwrap_or(0)))?;
     let port = listener.local_addr()?.port();
@@ -103,6 +110,7 @@ pub fn run(ctx: Arc<AppCtx>, port: Option<u16>, open: bool) -> Result<i32> {
         tokens: Arc::new(KeychainTokens::new(ctx.store.clone(), profiles.clone())),
         ctx,
         port,
+        allow_hosts,
         config: Mutex::new((mtime, config, profiles)),
         scanner,
         conns: AtomicUsize::new(0),
@@ -195,7 +203,7 @@ fn serve(d: &Dash, mut stream: TcpStream) {
 }
 
 fn route(d: &Dash, req: &Request) -> Response {
-    if !http::host_ok(req.header("host"), d.port) {
+    if !http::host_ok(req.header("host"), d.port, &d.allow_hosts) {
         return Response::text(403, "forbidden host");
     }
     if req.method != "GET" {
