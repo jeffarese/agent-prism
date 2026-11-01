@@ -9,6 +9,7 @@
 //!   (the watcher acting, `agp bg move`), so the two never race.
 //! - `<id>.rec.lock`: held for each read-modify-write of the record.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -160,11 +161,19 @@ impl Options {
 }
 
 /// How agent-prism launched the session (`agp --bg`), so a move can build
-/// the target's `--settings` again.
+/// the target's `--settings` and args again.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Launch {
-    /// The user's `--settings` value before agent-prism merged it.
+    /// The user's `--settings` value before agent-prism merged it (a path
+    /// made absolute).
     pub user_settings: Option<String>,
+    /// Names the session's settings files (`settings::file`).
+    pub key: Option<String>,
+    /// Per profile id: the args agent-prism put before the user's
+    /// (`[claude] args`, then the profile's) when it started the job there,
+    /// so a move takes out exactly those.
+    pub added: BTreeMap<String, Vec<String>>,
 }
 
 /// `<state>/bg/<session id>.json`. The keys up to `updated_at` are the
@@ -271,7 +280,7 @@ pub fn update(paths: &Paths, sid: &str, f: impl FnOnce(&mut Record)) -> Result<R
     Ok(rec)
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("record path has no parent")?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
@@ -305,14 +314,44 @@ pub fn list(paths: &Paths) -> Vec<Record> {
                 for ext in ["json", "lock", "act.lock", "rec.lock"] {
                     let _ = std::fs::remove_file(file(paths, sid, ext));
                 }
+                if let Some(key) = r.launch.as_ref().and_then(|l| l.key.as_deref()) {
+                    super::settings::remove(paths, key);
+                }
                 return None;
             }
             r.watching = watcher_alive(paths, &r.session_id);
+            if !r.watching
+                && !matches!(r.state, State::Ended | State::Moving)
+                && job_gone(paths, &r)
+            {
+                // Nobody watches (`stay`, or a watcher that died) and the job
+                // is gone: it ended.
+                if let Ok(u) = update(paths, sid, |x| {
+                    x.state = State::Ended;
+                    x.watcher_pid = None;
+                    x.note = Some("the job is gone".into());
+                }) {
+                    r = u;
+                }
+            }
             Some(r)
         })
         .collect();
     out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     out
+}
+
+/// The job folder of the record's profile is gone (`config_dir` null: the
+/// default install, `~/.claude`).
+fn job_gone(paths: &Paths, r: &Record) -> bool {
+    if r.short_id.is_empty() {
+        return false;
+    }
+    let dir = r
+        .config_dir
+        .as_ref()
+        .map_or_else(|| paths.home.join(".claude"), PathBuf::from);
+    !dir.join("jobs").join(&r.short_id).is_dir()
 }
 
 /// The record of a session id or a short id.
@@ -559,5 +598,17 @@ mod tests {
         assert!(list(&paths)[0].watching);
         drop(l);
         assert!(!watcher_alive(&paths, sid));
+
+        // Nobody watches and the job is gone: ended.
+        let jobs = dir.path().join("cfg/jobs/f1de9de1");
+        std::fs::create_dir_all(&jobs).unwrap();
+        update(&paths, sid, |r| {
+            r.state = State::Watching;
+            r.config_dir = Some(dir.path().join("cfg").to_string_lossy().into_owned());
+        })
+        .unwrap();
+        assert_eq!(list(&paths)[0].state, State::Watching);
+        std::fs::remove_dir_all(&jobs).unwrap();
+        assert_eq!(list(&paths)[0].state, State::Ended);
     }
 }

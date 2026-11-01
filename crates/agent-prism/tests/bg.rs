@@ -23,6 +23,12 @@ struct Setup {
 
 impl Setup {
     fn new() -> Setup {
+        Setup::with_args("", "", "")
+    }
+
+    /// With `[claude] args` and the args of profiles a and b (TOML arrays,
+    /// "" for none).
+    fn with_args(claude: &str, a: &str, b: &str) -> Setup {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let home = root.join("home");
@@ -34,14 +40,19 @@ impl Setup {
         let mut store = serde_json::Map::new();
         let exp = (now() + 7200) * 1000;
         let mut profiles = String::new();
-        for (id, label) in [("a", "PB2"), ("b", "PB4")] {
+        for (id, label, args) in [("a", "PB2", a), ("b", "PB4", b)] {
             let dir = home.join(format!(".claude-{id}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::os::unix::fs::symlink(common.join("projects"), dir.join("projects")).unwrap();
             let trust = serde_json::json!({"projects": {work.to_str().unwrap(): {"hasTrustDialogAccepted": true}}});
             std::fs::write(dir.join(".claude.json"), trust.to_string()).unwrap();
+            let args = if args.is_empty() {
+                String::new()
+            } else {
+                format!("args = {args}\n")
+            };
             profiles.push_str(&format!(
-                "[[profile]]\nid = \"{id}\"\nlabel = \"{label}\"\ndir = \"{}\"\n\n",
+                "[[profile]]\nid = \"{id}\"\nlabel = \"{label}\"\ndir = \"{}\"\n{args}\n",
                 dir.display()
             ));
             store.insert(
@@ -51,8 +62,13 @@ impl Setup {
                 )),
             );
         }
+        let claude = if claude.is_empty() {
+            String::new()
+        } else {
+            format!("args = {claude}\n")
+        };
         let config = format!(
-            "common_home = \"{}\"\n\n[claude]\nbin = \"{}\"\n\n{profiles}",
+            "common_home = \"{}\"\n\n[claude]\nbin = \"{}\"\n{claude}\n{profiles}",
             common.display(),
             fake.display()
         );
@@ -212,8 +228,15 @@ fn pgid(pid: i32) -> String {
 /// Launches `--bg` with pipes the way chief does and checks that agp exits
 /// at once and that nothing keeps the pipes open.
 fn launch(s: &Setup, opts: &[&str]) -> (String, String) {
+    launch_with(s, opts, &[])
+}
+
+/// `launch` with more claude args before the prompt.
+fn launch_with(s: &Setup, opts: &[&str], extra: &[&str]) -> (String, String) {
     let mut args: Vec<&str> = opts.to_vec();
-    args.extend(["--", "--bg", "--name", "n", "do the task"]);
+    args.extend(["--", "--bg", "--name", "n"]);
+    args.extend(extra);
+    args.push("do the task");
     let t = Instant::now();
     let mut child = s
         .cmd(&args)
@@ -372,10 +395,14 @@ fn launch_watch_and_move_on_limits() {
 #[test]
 fn watch_and_move_commands() {
     let s = Setup::new();
-    // `stay` (here from `fail`): no watcher.
+    // `stay` (here from `fail`): a record, no watcher.
     launch(&s, &["--as", "a", "--on-limit", "fail"]);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(s.sessions().is_empty());
+    let rec = s.sessions()[0].clone();
+    assert_eq!(rec["on_limit"], "stay");
+    assert_eq!(rec["state"], "watching");
+    assert_eq!(rec["watching"], false);
+    assert_eq!(rec["watcher_pid"], Value::Null);
     let jobs: Vec<_> = std::fs::read_dir(s.dir("a").join("jobs"))
         .unwrap()
         .flatten()
@@ -529,4 +556,136 @@ fn help_has_bg_lines_and_needs_no_stdin() {
         out.lines()
             .any(|l| l.trim_start().starts_with("agp bg move <session>"))
     );
+}
+
+/// The value after `--settings` in a fake log line.
+fn settings_arg(line: &str) -> String {
+    let mut it = line.split(' ');
+    it.find(|w| *w == "--settings");
+    it.next().unwrap_or_default().to_string()
+}
+
+fn read_json(path: &str) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn settings_files_and_profile_args() {
+    let s = Setup::with_args(
+        r#"["--permission-mode", "auto"]"#,
+        r#"["--model", "opus-a"]"#,
+        r#"["--effort", "high"]"#,
+    );
+    // An overlay for each account, so there is something to merge even if
+    // the memory dir is off in this environment.
+    for id in ["a", "b"] {
+        let o = s.root.join(format!("config/profiles/{id}/settings.json"));
+        std::fs::create_dir_all(o.parent().unwrap()).unwrap();
+        std::fs::write(&o, format!(r#"{{"env":{{"ACCOUNT":"{id}"}}}}"#)).unwrap();
+    }
+    let hooks = |v: &str| {
+        let h = format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"echo {v}"}}]}}]}}}}"#
+        );
+        std::fs::write(s.work.join("hooks.json"), h).unwrap();
+    };
+    hooks("v1");
+    // A relative --settings path, as chief may pass one.
+    launch_with(
+        &s,
+        &["--as", "a", "--on-limit", "switch"],
+        &["--settings", "hooks.json"],
+    );
+    let rec = s.wait_for("the watcher", |v| {
+        v["watching"] == true && v["watcher_pid"].is_i64()
+    });
+    let short = rec["short_id"].as_str().unwrap().to_string();
+    let sid = rec["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        rec["launch"]["added"]["a"],
+        serde_json::json!(["--permission-mode", "auto", "--model", "opus-a"])
+    );
+    assert_eq!(
+        rec["launch"]["user_settings"],
+        s.work.join("hooks.json").to_str().unwrap()
+    );
+
+    // The launch passes a file of agp's, not inline JSON.
+    let log = s.log_text();
+    let line = log
+        .lines()
+        .find(|l| l.contains("args=--permission-mode"))
+        .unwrap();
+    assert!(
+        line.contains(
+            "args=--permission-mode auto --model opus-a --bg --name n do the task --settings "
+        ),
+        "{line}"
+    );
+    let file_a = settings_arg(line);
+    let dir = s.root.join("state/bg/settings");
+    assert!(
+        file_a.starts_with(dir.to_str().unwrap()) && file_a.ends_with("-a.json"),
+        "{file_a}"
+    );
+    let v = read_json(&file_a);
+    assert_eq!(v["env"]["ACCOUNT"], "a");
+    assert!(v.to_string().contains("echo v1"));
+
+    // chief rewrites its hooks and calls `agp bg watch` before a respawn.
+    hooks("v2");
+    let (code, out, err) = s.run(&["bg", "watch", &short]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("already runs"), "{out}");
+    let v = read_json(&file_a);
+    assert!(v.to_string().contains("echo v2"), "{v}");
+    assert!(!v.to_string().contains("echo v1"));
+    assert_eq!(v["env"]["ACCOUNT"], "a");
+
+    // A move to b: b's own file and args, a's args gone.
+    let (code, _, err) = s.run(&["bg", "move", &short, "--to", "b", "--json"]);
+    assert_eq!(code, 0, "{err}\n{}", s.log_text());
+    let log = s.log_text();
+    let b_line = log
+        .lines()
+        .find(|l| {
+            l.starts_with(&format!("cfg={} ", s.dir("b").display())) && l.contains("--resume")
+        })
+        .unwrap();
+    assert!(
+        b_line.contains(&format!(
+            "args=--bg --resume {sid} --permission-mode auto --effort high --name n --settings "
+        )),
+        "{b_line}"
+    );
+    assert!(!b_line.contains("opus-a"), "{b_line}");
+    let file_b = settings_arg(b_line);
+    assert_eq!(file_b, file_a.replace("-a.json", "-b.json"));
+    let v = read_json(&file_b);
+    assert_eq!(v["env"]["ACCOUNT"], "b");
+    assert!(v.to_string().contains("echo v2"));
+    let rec = s.sessions()[0].clone();
+    assert_eq!(
+        rec["launch"]["added"]["b"],
+        serde_json::json!(["--permission-mode", "auto", "--effort", "high"])
+    );
+
+    // Back to a: the wake form, after a's file is written again.
+    hooks("v3");
+    let (code, _, err) = s.run(&["bg", "move", &short, "--to", "a"]);
+    assert_eq!(code, 0, "{err}\n{}", s.log_text());
+    let log = s.log_text();
+    let a_line = log
+        .lines()
+        .rfind(|l| {
+            l.starts_with(&format!("cfg={} ", s.dir("a").display())) && l.contains("--resume")
+        })
+        .unwrap();
+    assert!(
+        a_line.contains(&format!("args=--bg --resume {sid} [agent-prism]")),
+        "{a_line}"
+    );
+    assert!(read_json(&file_a).to_string().contains("echo v3"));
+    // b's file is only written when the session goes back to b.
+    assert!(read_json(&file_b).to_string().contains("echo v2"));
 }

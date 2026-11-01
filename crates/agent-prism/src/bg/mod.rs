@@ -6,6 +6,7 @@ mod claude;
 mod job;
 mod mover;
 mod record;
+mod settings;
 mod watch;
 
 use std::io::{Read, Write};
@@ -27,6 +28,8 @@ use crate::app::AppCtx;
 use crate::cli::{BgCommand, LaunchArgs, RunOptions};
 use crate::launch::unix_now;
 use crate::session::Prepared;
+
+pub(crate) use self::settings::value as settings_value;
 
 /// How long a launch waits for the job's `state.json`.
 const JOB_WAIT: Duration = Duration::from_secs(5);
@@ -53,7 +56,8 @@ pub fn run(ctx: &AppCtx, cmd: BgCommand) -> Result<i32> {
 /// run `claude --bg …` there (stdin, stdout, stderr and the exit code pass
 /// through), then leave a detached watcher for the session.
 pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
-    let acct = match crate::session::prepare_print(ctx, args)? {
+    let key = settings::new_key();
+    let acct = match crate::session::prepare_print(ctx, args, Some(&key))? {
         Prepared::Exit(code) => return Ok(code),
         Prepared::Plain(cmd) => return crate::session::exec_print(cmd, Tool::Claude),
         Prepared::Account(a) => a,
@@ -106,9 +110,7 @@ pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         "bg {short}: launched on {} (on limit: {on_limit:?})",
         profile.id
     );
-    if on_limit == OnLimit::Stay {
-        return Ok(code);
-    }
+    let added = crate::session::added_args(&config, &profile);
     let req = WatchReq {
         profile: &profile,
         short: &short,
@@ -117,11 +119,22 @@ pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         name: launched.and_then(|l| l.name),
         options: Options::new(&args.run, args.policy),
         on_limit,
-        launch: Some(Launch { user_settings }),
+        launch: Some(Launch {
+            user_settings: settings::user_value(user_settings, &cwd),
+            key: Some(key),
+            added: [(profile.id.clone(), added)].into(),
+        }),
         run: Some(journal.run().to_string()),
     };
-    if let Err(e) = ensure_watcher(ctx, &req) {
-        note(&format!("starting the watcher for {short}: {e:#}"));
+    // `stay`: only the record (its settings file can be written again by
+    // `agp bg watch`, which also arms a watcher), no watcher.
+    let res = if on_limit == OnLimit::Stay {
+        write_record(ctx, &req).map(|_| ())
+    } else {
+        ensure_watcher(ctx, &req).map(|_| ())
+    };
+    if let Err(e) = res {
+        note(&format!("recording {short}: {e:#}"));
     }
     Ok(code)
 }
@@ -235,7 +248,22 @@ struct WatchReq<'a> {
 /// Writes the record and starts the detached watcher unless one runs (it
 /// reads the new options from the record).
 fn ensure_watcher(ctx: &AppCtx, req: &WatchReq) -> Result<(Record, bool)> {
-    let rec = record::update(&ctx.paths, req.sid, |r| {
+    let rec = write_record(ctx, req)?;
+    if record::watcher_alive(&ctx.paths, req.sid) {
+        log::info!("bg {}: a watcher runs already; options updated", req.short);
+        return Ok((rec, false));
+    }
+    let exe = std::env::current_exe().context("locating the agp binary")?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["bg", "_watch", req.sid]);
+    let pid = claude::spawn_detached(cmd)?;
+    log::info!("bg {}: watcher started (pid {pid})", req.short);
+    Ok((rec, true))
+}
+
+/// The record of a launch or a watch request.
+fn write_record(ctx: &AppCtx, req: &WatchReq) -> Result<Record> {
+    record::update(&ctx.paths, req.sid, |r| {
         r.short_id = req.short.to_string();
         r.name = req
             .name
@@ -262,17 +290,10 @@ fn ensure_watcher(ctx: &AppCtx, req: &WatchReq) -> Result<(Record, bool)> {
             r.state = State::Watching;
             r.note = Some("watch re-armed".into());
         }
-    })?;
-    if record::watcher_alive(&ctx.paths, req.sid) {
-        log::info!("bg {}: a watcher runs already; options updated", req.short);
-        return Ok((rec, false));
-    }
-    let exe = std::env::current_exe().context("locating the agp binary")?;
-    let mut cmd = Command::new(exe);
-    cmd.args(["bg", "_watch", req.sid]);
-    let pid = claude::spawn_detached(cmd)?;
-    log::info!("bg {}: watcher started (pid {pid})", req.short);
-    Ok((rec, true))
+        if req.on_limit == OnLimit::Stay && req.launch.is_some() {
+            r.note = Some("on limit: stay, so no watcher; `agp bg watch` arms one".into());
+        }
+    })
 }
 
 /// The profile and short id of a session given by session or short id:
@@ -355,6 +376,21 @@ fn watch_cmd(
         launch: None,
         run: new_run,
     };
+    // Before a `claude respawn`: the respawned process reads this file.
+    if let Some(l) = rec.as_ref().and_then(|r| r.launch.as_ref())
+        && let Some(key) = &l.key
+    {
+        let cwd = job
+            .cwd
+            .clone()
+            .or_else(|| rec.as_ref().and_then(|r| r.cwd.clone()));
+        let cwd = cwd.map(PathBuf::from).unwrap_or_default();
+        match settings::refresh(&ctx.paths, key, &profile, &cwd, l.user_settings.as_deref()) {
+            Ok(true) => log::info!("bg {short}: settings for {} written again", profile.id),
+            Ok(false) => {}
+            Err(e) => note(&format!("writing the settings of {short} again: {e:#}")),
+        }
+    }
     let (rec, started) = ensure_watcher(ctx, &req)?;
     let name = rec
         .name

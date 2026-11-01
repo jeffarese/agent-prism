@@ -44,6 +44,7 @@ proxy setup) is never offered as an account.
 | Adopt journals | `<state>/adopt/<ts>-<profile>.json` | |
 | Run journal | `<state>/runs.jsonl` (cut to its newest half at 8 MB) | |
 | Background sessions | `<state>/bg/<session id>.json` (+ `.lock`, `.act.lock`, `.rec.lock`) | |
+| Their `--settings` files | `<state>/bg/settings/<launch key>-<profile id>.json` | |
 
 All path defaults are computed in one place (`prism_core::paths`). Library
 functions take paths as parameters so that tests use temp dirs. Tests must
@@ -791,8 +792,9 @@ detached watcher process does. Facts (Claude Code 2.1.316):
   runs it (the moved session still uses the worktree).
 
 **Launch** (`agp [opts] [--] --bg <claude args…>`, Claude only). The pick,
-env and `--settings` (overlay, memory dir) are print mode's (§7.4), with
-the per-run options; trust is synced (§4.7). Never the wrapper, and the
+env, args and `--settings` (overlay, memory dir) are print mode's (§7.4),
+with the per-run options, except where the settings go (below); trust is
+synced (§4.7). Never the wrapper, and the
 nested-session check does not apply (`AGP=1` changes nothing). claude runs
 with stdin and stderr inherited and stdout copied through as it comes (to
 read the short id); agent-prism waits for claude to exit, reads the pipe
@@ -800,9 +802,29 @@ for at most 1 s more (a supervisor claude started may hold it) and exits
 with claude's code. A non-zero exit: nothing else. Else: the short id from
 the output (else the newest job of the profile created for this cwd since
 the launch), the session id from its `state.json` (waiting up to 5 s, else
-`claude agents`), a journal `start`, and, unless the effective on-limit is
-`stay`, the watcher. A problem there is one stderr note; the exit code
-stays claude's.
+`claude agents`), a journal `start`, the record, and, unless the
+effective on-limit is `stay`, the watcher. A problem there is one stderr
+note; the exit code stays claude's.
+
+**Settings files.** Claude Code saves a job's flags (`respawnFlags`) and
+reuses them on `claude respawn` and on a wake, so inline JSON in
+`--settings` would freeze the settings of the launch: an orchestrator that
+rewrites its `--settings` file before a respawn would never reach the
+session again. So when agent-prism merges settings for a background
+session (the overlay and/or the memory dir, with or without a user
+`--settings` file), it writes the merge to
+`<state>/bg/settings/<key>-<profile id>.json` (atomically) and passes that
+path. `key` is the launch's (made before claude prints the session id,
+kept in the record's `launch.key`); the path stays the same for a session
+and profile, since that profile's job keeps it. A user value that is
+inline JSON, or nothing to merge (the user's file or the overlay alone),
+goes as print mode passes it. The file is written again from the user's
+value (a relative path made absolute against the launch folder, read
+fresh), the profile's overlay and memory dir: before every resume or wake
+in a profile (the flags form writes the target's file; the wake form
+rewrites the file its saved flags name), and in `agp bg watch` for the
+session's current profile before it returns. A user file that can't be
+read or merged leaves the old file as it is. The files go with the record.
 
 **The watcher** (`agp bg _watch <session id>`). Spawned with `setsid` (a
 new session and process group, so a timeout that kills the launch's group
@@ -867,9 +889,12 @@ the pool too) after the same two checks.
    that is another profile), logged; the limit is not handled again.
 4. Resume in the target's env with cwd = the job's `cwd`: the flags form
    with the old job's `respawnFlags` when the target has no
-   `jobs/<short>` (a session agent-prism launched gets its `--settings`
-   built again for the target from the user's original value), else the
-   no-flag form. The prompt: a one-line note ("This session moved from
+   `jobs/<short>`, else the no-flag form. For a session agent-prism
+   launched, the flags form takes out the args agent-prism added for the
+   old account (`[claude] args` and the profile's `args`, as recorded in
+   `launch.added` for that profile when its job was started), puts the
+   target's in front (recorded for the target) and passes the target's
+   settings file (above). The prompt: a one-line note ("This session moved from
    account A to B after the 5-hour limit" / "on request" for
    `agp bg move` / "agent-prism waited for the reset on the same account
    (A) after the 5-hour limit"; "the old process's background tasks and
@@ -914,8 +939,12 @@ ran in before the current one, oldest first, without repeats and without
 the current profile (where the stopped old jobs are). `watching`: a
 watcher holds the lock now. Extra keys: `created_at`, `wait_until`,
 `note` (the last thing that happened), `options` (the watch's per-run
-options), `run` (journal run id), `launch`, `limit_key`. Records of
-sessions that ended a week ago are removed when listed.
+options), `run` (journal run id), `launch` (`user_settings`, `key`,
+`added`: what agent-prism launched with), `limit_key`. A launch with
+on-limit `stay` writes the record too (no watcher, `watching: false`). A
+record nobody watches whose job folder is gone becomes `ended` when
+listed; records (and settings files) of sessions that ended a week ago
+are removed when listed.
 
 **`agp bg watch <session id | short id> [--as <id>] [--policy <p>] [per-run
 opts]`**: the profile is `--as`, else the one whose `jobs/` has the short
@@ -923,8 +952,10 @@ id (the newest `state.json` when several do: the old accounts keep their
 stopped jobs). It writes the record with the given options (replacing the
 old ones; the on-limit from the config when none is given) and starts the
 detached watcher unless one runs (which reads the new options in its next
-round). A session agent-prism did not launch gets a journal run of its
-own. Exits 0 at once; the orchestrator calls it after `claude respawn`.
+round). It writes the session's settings file for that profile again
+first (above). A session agent-prism did not launch gets a journal run of
+its own. Exits 0 at once; an orchestrator calls it right before (for the
+settings) or after `claude respawn`.
 
 **`agp bg move <session> [--to <id>] [--json]`**: moves now, without a
 limit, in the foreground within about 60 s (the watch's options apply to

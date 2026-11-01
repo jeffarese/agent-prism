@@ -181,7 +181,7 @@ agp --bg --name fix-auth "fix the auth bug"
 agp --as work --on-limit wait -- --bg --name nightly "run the migration"
 agp bg                        # the sessions agp watches, their account and state
 agp bg --json                 # the same as JSON (for scripts and orchestrators)
-agp bg watch f1de9de1         # watch a session agp did not start (or after claude respawn)
+agp bg watch f1de9de1         # watch a session agp did not start (or around claude respawn)
 agp bg move f1de9de1 --to b   # move a session to another account now
 ```
 
@@ -202,7 +202,11 @@ Moves need shared `projects/` (`agp adopt`) and a trusted folder in the
 target account (agp copies folder trust). agp never deletes a job: after a
 move the old account keeps the stopped job, because the session still uses
 its worktree. `--accounts`, `--exclude`, `--max-usage` and `--policy`
-apply to the first pick and to every move.
+apply to the first pick and to every move. When agp merges settings into
+your `--settings` file it passes a file of its own that it writes again
+from yours on every move and on `agp bg watch`, so rewrite your file and
+run `agp bg watch <id>` before a `claude respawn` to give the session new
+hooks.
 
 ## Agents: the agp skill
 

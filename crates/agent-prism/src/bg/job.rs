@@ -282,6 +282,19 @@ fn strip_bg(flags: &[String]) -> Vec<String> {
     out
 }
 
+/// `flags` without the first run of `args` (agent-prism's args for the
+/// account the flags were saved in); unchanged when they aren't there.
+pub fn remove_args(flags: &[String], args: &[String]) -> Vec<String> {
+    let n = args.len();
+    match (n > 0)
+        .then(|| flags.windows(n).position(|w| w == args))
+        .flatten()
+    {
+        Some(i) => flags[..i].iter().chain(&flags[i + n..]).cloned().collect(),
+        None => flags.to_vec(),
+    }
+}
+
 /// `flags` with every `--settings <v>` removed, and `settings` added.
 pub fn replace_settings(flags: &[String], settings: Option<String>) -> Vec<String> {
     let mut out = Vec::new();
@@ -515,6 +528,17 @@ mod tests {
         let lines = "{\"id\":\"a1b2c3d4\",\"pid\":7}\n{\"id\":\"b1b2c3d4\"}\n";
         assert_eq!(parse_agents(lines)[0].pid, Some(7));
         assert!(parse_agents("No sessions").is_empty());
+    }
+
+    #[test]
+    fn args_removed() {
+        let flags = v(&["--model", "a", "--name", "x", "--model", "a"]);
+        assert_eq!(
+            remove_args(&flags, &v(&["--model", "a"])),
+            v(&["--name", "x", "--model", "a"])
+        );
+        assert_eq!(remove_args(&flags, &v(&["--effort", "high"])), flags);
+        assert_eq!(remove_args(&flags, &[]), flags);
     }
 
     #[test]

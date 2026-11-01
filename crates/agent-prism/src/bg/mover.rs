@@ -247,20 +247,73 @@ pub fn candidates(env: &Env, s: &Session) -> Vec<Profile> {
 }
 
 /// The flags of a resume in `target` (a profile with no job for the
-/// session): the saved launch flags, with agent-prism's `--settings` built
-/// again for `target` when agent-prism launched the session.
-fn flags_for(env: &Env, s: &Session, target: &Profile) -> Vec<String> {
+/// session): the saved launch flags. When agent-prism launched the
+/// session, the args it added for the old account give way to the
+/// target's (returned too, for the record) and its `--settings` is built
+/// again for `target`.
+fn flags_for(env: &Env, s: &Session, target: &Profile) -> (Vec<String>, Option<Vec<String>>) {
     let flags = s.job.respawn_flags.clone();
     let Some(l) = &s.launch else {
-        return flags;
+        return (flags, None);
     };
-    let overlay = env.app.paths.profile_overlay(&target.id);
-    let overlay = overlay.is_file().then_some(overlay);
-    let settings =
-        crate::session::print_settings(l.user_settings.clone(), overlay.as_deref(), |u, o| {
-            launch::memory_dir(target, &s.cwd, &[u, o], |k| std::env::var(k).ok())
-        });
-    job::replace_settings(&flags, settings)
+    let old = l.added.get(&s.from.id).map_or(&[][..], Vec::as_slice);
+    let added = crate::session::added_args(&env.config, target);
+    let mut out = added.clone();
+    out.extend(job::remove_args(&flags, old));
+    let settings = match &l.key {
+        Some(key) => super::settings::value(
+            &env.app.paths,
+            key,
+            target,
+            &s.cwd,
+            l.user_settings.as_deref(),
+        ),
+        None => {
+            let overlay = env.app.paths.profile_overlay(&target.id);
+            let overlay = overlay.is_file().then_some(overlay);
+            crate::session::print_settings(l.user_settings.clone(), overlay.as_deref(), |u, o| {
+                launch::memory_dir(target, &s.cwd, &[u, o], |k| std::env::var(k).ok())
+            })
+        }
+    };
+    (job::replace_settings(&out, settings), Some(added))
+}
+
+/// Before a resume in `target`: the flags of the flags form (`None`: the
+/// wake form). Records the args agent-prism adds there, and for a wake
+/// writes the session's settings file for `target` again (the woken job's
+/// saved flags name it).
+fn prepare_resume(env: &Env, s: &Session, target: &Profile, has_job: bool) -> Option<Vec<String>> {
+    let paths = &env.app.paths;
+    if has_job {
+        if let Some(l) = &s.launch
+            && let Some(key) = &l.key
+            && let Err(e) =
+                super::settings::refresh(paths, key, target, &s.cwd, l.user_settings.as_deref())
+        {
+            log::warn!(
+                "bg {}: writing the settings for {} again: {e:#}",
+                s.short,
+                target.id
+            );
+        }
+        return None;
+    }
+    let (flags, added) = flags_for(env, s, target);
+    if let Some(added) = added
+        && let Err(e) = record::update(paths, &s.sid, |r| {
+            if let Some(l) = &mut r.launch {
+                l.added.insert(target.id.clone(), added);
+            }
+        })
+    {
+        log::warn!(
+            "bg {}: recording the args for {}: {e:#}",
+            s.short,
+            target.id
+        );
+    }
+    Some(flags)
 }
 
 /// The first prompt after a stop: a one-line note, a blank line, then the
@@ -496,7 +549,7 @@ fn resume_in(env: &Env, s: &Session, target: &Profile, prompt: String) -> Result
     // A profile that has the job takes the no-flag form; flags would start
     // a copy under a new id.
     let has_job = job::job_dir(&target.dir, short).is_dir();
-    let flags = (!has_job).then(|| flags_for(env, s, target));
+    let flags = prepare_resume(env, s, target, has_job);
     let args = job::resume_args(&s.sid, flags.as_deref(), &prompt);
     log::info!(
         "bg {short}: resume in {} ({} form)",

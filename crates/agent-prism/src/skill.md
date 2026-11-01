@@ -71,7 +71,7 @@ reset and wakes it) when it hits a limit:
 agp --bg --name fix-auth "fix the auth bug"     # instead of claude --bg
 agp --on-limit wait --max-wait 6h -- --bg "migrate the tests"
 agp bg --json        # watched sessions: account, state, limit, moves
-agp bg watch <id>    # after `claude respawn <id>`, or for a session agp didn't start
+agp bg watch <id>    # around `claude respawn <id>` (refreshes --settings), or for a session agp didn't start
 agp bg move <id> --to <account>   # move one now
 ```
 

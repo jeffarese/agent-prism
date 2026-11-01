@@ -253,7 +253,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
 /// blocks; when agent-prism can't pick it still runs the tool.
 pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
     let tool = args.tool;
-    match prepare_print(ctx, args)? {
+    match prepare_print(ctx, args, None)? {
         Prepared::Exit(code) => Ok(code),
         Prepared::Plain(cmd) => exec_print(cmd, tool),
         Prepared::Account(a) => {
@@ -293,8 +293,13 @@ pub(crate) struct PrintAccount {
 /// Picks the account for a print-mode line and builds its command: the
 /// account env, and for Claude the merged `--settings` (overlay, memory
 /// dir). The per-run options (`--accounts`, `--exclude`, `--max-usage`)
-/// narrow the pick.
-pub(crate) fn prepare_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<Prepared> {
+/// narrow the pick. `bg_key`: a `--bg` launch, whose merged settings go to
+/// a file (`bg::settings`).
+pub(crate) fn prepare_print(
+    ctx: &AppCtx,
+    args: &LaunchArgs,
+    bg_key: Option<&str>,
+) -> Result<Prepared> {
     let tool = args.tool;
     let loaded = Config::load(&ctx.paths);
     let (mut config, reason) = match loaded {
@@ -409,9 +414,14 @@ pub(crate) fn prepare_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<Prepared>
     } else {
         let overlay = ctx.paths.profile_overlay(&profile.id);
         let overlay = overlay.is_file().then_some(overlay);
-        let settings = print_settings(user_settings.clone(), overlay.as_deref(), |u, o| {
-            launch::memory_dir(&profile, &cwd, &[u, o], |k| std::env::var(k).ok())
-        });
+        let settings = match bg_key {
+            Some(key) => {
+                crate::bg::settings_value(&ctx.paths, key, &profile, &cwd, user_settings.as_deref())
+            }
+            None => print_settings(user_settings.clone(), overlay.as_deref(), |u, o| {
+                launch::memory_dir(&profile, &cwd, &[u, o], |k| std::env::var(k).ok())
+            }),
+        };
         cmd.args(print_args(&config, &profile, &user_args, settings));
     }
     let (set, remove) = launch::child_env(&profile, std::path::Path::new(""));
@@ -493,12 +503,19 @@ pub(crate) fn print_args(
     user_args: &[String],
     settings: Option<String>,
 ) -> Vec<String> {
-    let mut out = config.claude.args.clone();
-    out.extend(profile.args.iter().cloned());
+    let mut out = added_args(config, profile);
     let extra = settings
         .map(|s| vec!["--settings".into(), s])
         .unwrap_or_default();
     out.extend(launch::splice_args(user_args, extra));
+    out
+}
+
+/// The Claude args agent-prism puts before the user's: `[claude] args`,
+/// then the profile's.
+pub(crate) fn added_args(config: &Config, profile: &Profile) -> Vec<String> {
+    let mut out = config.claude.args.clone();
+    out.extend(profile.args.iter().cloned());
     out
 }
 
