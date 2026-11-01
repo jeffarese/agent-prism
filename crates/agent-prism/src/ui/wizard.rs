@@ -365,6 +365,9 @@ impl Wizard {
                     identity,
                     token,
                     sessions_elsewhere: 0,
+                    load: 0.0,
+                    slope_5h: None,
+                    run_rate: None,
                     active_here: false,
                     last_used: None,
                 }
@@ -377,6 +380,8 @@ impl Wizard {
             settings: balance_settings(&cfg),
             exclude: None,
             stale_after_secs: 600,
+            run_load: 0.0,
+            prefer: None,
         };
         build_views(&inputs, &usage, &HashMap::new(), &vctx)
     }

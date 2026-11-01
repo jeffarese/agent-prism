@@ -67,15 +67,15 @@ fn weighted_slope(points: &[(i64, f64)]) -> Option<f64> {
     (den > 0.0).then(|| num / den)
 }
 
-fn project_window(
+/// The utilization slope (percent per second, never negative) of the
+/// samples in `[now - lookback, now]` after the last reset; `None` with too
+/// few samples or too short a span.
+fn recent_slope(
     samples: &[Sample],
     get: impl Fn(&Sample) -> Option<f64>,
-    w: Option<&Window>,
     lookback: i64,
     now: i64,
-) -> Option<f64> {
-    let w = w?;
-    let reset = w.resets_at?;
+) -> Option<(f64, i64)> {
     let mut points: Vec<(i64, f64)> = samples
         .iter()
         .filter(|s| s.ts >= now - lookback && s.ts <= now)
@@ -89,9 +89,33 @@ fn project_window(
     if points.len() < MIN_SAMPLES || points.last()?.0 - points.first()?.0 < MIN_SPAN_SECS {
         return None;
     }
-    let rate = weighted_slope(&points)?.max(0.0);
+    Some((weighted_slope(&points)?.max(0.0), points.last()?.0))
+}
+
+fn project_window(
+    samples: &[Sample],
+    get: impl Fn(&Sample) -> Option<f64>,
+    w: Option<&Window>,
+    lookback: i64,
+    now: i64,
+) -> Option<f64> {
+    let w = w?;
+    let reset = w.resets_at?;
+    let (rate, _) = recent_slope(samples, get, lookback, now)?;
     let remaining = (reset - now).max(0) as f64;
     Some((w.utilization + rate * remaining).clamp(0.0, 100.0))
+}
+
+/// A burn rate needs a sample at most this old.
+pub const RATE_FRESH_SECS: i64 = 15 * 60;
+
+/// How fast the 5h window fills now: the slope of the last hour of
+/// samples, in percent per hour. `None` with too few samples or when the
+/// newest is older than [`RATE_FRESH_SECS`]. It counts all use of the
+/// account, also from outside agent-prism.
+pub fn rate_5h(samples: &[Sample], now: i64) -> Option<f64> {
+    let (rate, newest) = recent_slope(samples, |x| x.u5h, LOOKBACK_5H_SECS, now)?;
+    (now - newest <= RATE_FRESH_SECS).then_some(rate * 3600.0)
 }
 
 /// Projects utilization at the next reset of each window from recent
@@ -210,5 +234,44 @@ mod tests {
         // Unknown reset.
         let s = snap(20.0, None);
         assert_eq!(project(&samples(now, 0.1, 7, 300), &s, now).five_hour, None);
+    }
+
+    #[test]
+    fn burn_rate_of_the_last_hour() {
+        let now = 100_000;
+        let pts = |xs: &[(i64, f64)]| -> Vec<Sample> {
+            xs.iter()
+                .map(|&(t, u)| Sample {
+                    ts: now - t,
+                    u5h: Some(u),
+                    u7d: None,
+                })
+                .collect()
+        };
+        // 10% in 30 min: 20%/h.
+        let r = rate_5h(
+            &pts(&[(1800, 10.0), (1200, 13.3), (600, 16.7), (0, 20.0)]),
+            now,
+        )
+        .unwrap();
+        assert!((r - 20.0).abs() < 0.5, "{r}");
+        // Too old: the newest sample is 20 min old.
+        assert_eq!(
+            rate_5h(&pts(&[(3000, 10.0), (2400, 13.0), (1200, 16.0)]), now),
+            None
+        );
+        // A reset in between: only the samples after it count (too few).
+        assert_eq!(
+            rate_5h(
+                &pts(&[(1800, 80.0), (1200, 90.0), (600, 2.0), (0, 4.0)]),
+                now
+            ),
+            None
+        );
+        // Never negative.
+        assert_eq!(
+            rate_5h(&pts(&[(1800, 20.0), (1200, 19.5), (0, 19.2)]), now),
+            Some(0.0)
+        );
     }
 }

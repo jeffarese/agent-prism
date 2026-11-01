@@ -341,7 +341,7 @@
     if (a.next_pick) return el('span', { class: 'chip next' }, icon('arrow', 12), 'Next pick');
     if (a.token.state === 'missing') return el('span', { class: 'chip crit' }, icon('key', 12), 'Not logged in');
     if (a.token.state === 'unreadable') return el('span', { class: 'chip warn' }, icon('key', 12), 'Login unreadable');
-    if (a.token.state === 'expired') return el('span', { class: 'chip warn' }, icon('key', 12), 'Token expired');
+    if (a.token.state === 'expired') return el('span', { class: 'chip dim', title: 'Still logged in: the next run here refreshes the token' }, icon('clock', 12), 'Idle');
     if (!a.fetched_at) return el('span', { class: 'chip dim' }, icon('dash', 12), 'No usage yet');
     if (a.usage_status.state === 'stale') return el('span', { class: 'chip dim' }, icon('clock', 12), 'Stale');
     if (!a.in_pool) return el('span', { class: 'chip dim' }, icon('minus', 12), 'Out of pool');
@@ -366,8 +366,8 @@
         a.limited.until ? [' · resets in ', el('b', { 'data-until': a.limited.until }, dur(a.limited.until - nowS()))] : '',
         '. New sessions skip it until then.'));
     } else if (a.token.state === 'expired' && a.fetched_at) {
-      body.push(el('div', { class: 'acct-note' }, 'Login token expired ', el('span', { 'data-ago': a.token.since }, ago(a.token.since)),
-        `. The numbers are from the last poll; ${a.tool === 'codex' ? 'Codex' : 'Claude'} refreshes the token the next time it runs on this account.`));
+      body.push(el('div', { class: 'acct-note' }, 'Idle: unused for hours, its token ran out ', el('span', { 'data-ago': a.token.since }, ago(a.token.since)),
+        `. Still logged in and usable; the numbers are from the last poll, and ${a.tool === 'codex' ? 'Codex' : 'Claude'} refreshes the token the next time it runs here.`));
     } else if (!a.fetched_at) {
       const why = a.token.state === 'missing' ? `Log in with agp add ${a.id} to use this account.`
         : a.last_error ? `The last poll failed: ${a.last_error}.`

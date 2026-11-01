@@ -154,7 +154,18 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         .then(|| launch::session_model(&user_args, &common))
         .flatten();
 
-    let profile = choose(&ctx, &config, &profiles, &tokens, &args, model.clone(), tty)?;
+    let cwd = std::env::current_dir().context("current dir")?;
+    let profile = choose(
+        &ctx,
+        &config,
+        &profiles,
+        &tokens,
+        &args,
+        model.clone(),
+        tty,
+        launch::has_prompt(&user_args),
+        &cwd,
+    )?;
     let Some((profile, reason)) = profile else {
         return Ok(1);
     };
@@ -183,7 +194,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         user_settings,
         run_dir,
         exe: std::env::current_exe().context("locating the agp binary")?,
-        cwd: std::env::current_dir().context("current dir")?,
+        cwd,
         memory_key: Default::default(),
     };
     guard.sock = builder.sock();
@@ -260,8 +271,11 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
             let now = unix_now();
             let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Exec, now);
             let mut ev = journal.event(EventKind::Start, &a.profile.id, now);
+            ev.reason = Some(a.reason.clone());
+            ev.session = a.session_id.clone();
             ev.cwd = Some(a.cwd.to_string_lossy().into_owned());
             journal.write(ev);
+            // The claim stays: the tool keeps this pid (DESIGN §6.6).
             exec_print(a.cmd, tool)
         }
     }
@@ -288,6 +302,9 @@ pub(crate) struct PrintAccount {
     /// The user's `--settings` value (Claude), before agent-prism merged it.
     pub user_settings: Option<String>,
     pub cwd: PathBuf,
+    /// The conversation the line runs, when known: the `--session-id`
+    /// agent-prism added (Claude print mode), or the one it resumes.
+    pub session_id: Option<String>,
 }
 
 /// Picks the account for a print-mode line and builds its command: the
@@ -347,20 +364,50 @@ pub(crate) fn prepare_print(
         Tool::Claude => launch::take_user_settings(&args.tool_args),
         Tool::Codex => (args.tool_args.clone(), None),
     };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    // A Claude line that names no session gets an id, so that the journal
+    // knows it (resume affinity, the dashboard).
+    let session_id =
+        (tool == Tool::Claude && bg_key.is_none() && !launch::has_session_flag(&user_args))
+            .then(|| uuid::Uuid::new_v4().to_string());
+    let user_args = match &session_id {
+        Some(id) => launch::splice_args(&user_args, vec!["--session-id".into(), id.clone()]),
+        None => user_args,
+    };
+    // A resume: the conversation, and the account that ran it last.
+    let resume = crate::affinity::resume(&ctx.paths, tool, &args.tool_args, &cwd);
+    let session_id = session_id.or_else(|| resume.as_ref().and_then(|r| r.session.clone()));
+    // The claim on the account (DESIGN §6.6): an exec'd line keeps it for
+    // the tool's lifetime (same pid); a `--bg` launch until its record is
+    // written.
+    let mode = if bg_key.is_some() {
+        RunMode::Bg
+    } else {
+        RunMode::Exec
+    };
+    let claim = |p: &Profile| {
+        let rec = launch::claim_record(&p.id, tool, mode, session_id.clone(), &cwd, true);
+        launch::write_claim(&ctx.paths, &rec);
+        launch::touch_last_used(&ctx.paths, &p.id, unix_now());
+    };
     let (profile, reason) = if let Some(id) = &args.as_profile {
         let p = profiles
             .iter()
             .find(|p| &p.id == id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"))?;
+        // Under the lock too, so that a pick running now sees it.
+        let _lock = registry::PickLock::acquire(&ctx.paths, launch::PICK_WAIT);
+        claim(&p);
         (p, "pinned with --as".to_string())
     } else {
         let model = tool
             .is_claude()
             .then(|| launch::session_model(&user_args, &config.common_home(&ctx.paths)))
             .flatten();
-        let snap = launch::snapshot(ctx, &config, &profiles, &tokens, args.policy, model);
-        match snap
+        let prefer = resume.and_then(|r| r.account);
+        let snap = launch::snapshot(ctx, &config, &profiles, &tokens, args.policy, model, prefer);
+        let chosen = match snap
             .pick
             .chosen
             .as_ref()
@@ -373,10 +420,11 @@ pub(crate) fn prepare_print(
             None => {
                 let reset = snap
                     .pick
-                    .earliest_reset
+                    .earliest_id
                     .as_ref()
-                    .and_then(|(label, until)| {
-                        let p = profiles.iter().find(|p| &p.label == label)?;
+                    .zip(snap.pick.earliest_reset.as_ref())
+                    .and_then(|(id, (_, until))| {
+                        let p = profiles.iter().find(|p| &p.id == id)?;
                         Some((p.clone(), *until))
                     });
                 let (p, note) = match reset {
@@ -402,11 +450,12 @@ pub(crate) fn prepare_print(
                 log::warn!("print mode fallback to {}: {note}", p.id);
                 (p, note)
             }
-        }
+        };
+        claim(&chosen.0);
+        drop(snap);
+        chosen
     };
     log::info!("print mode on {}", profile.id);
-    launch::touch_last_used(&ctx.paths, &profile.id, unix_now());
-    let cwd = std::env::current_dir().unwrap_or_default();
     let mut cmd = Command::new(&program);
     if tool == Tool::Codex {
         let (_, config_args) = config.tool_bin_args(tool);
@@ -436,6 +485,7 @@ pub(crate) fn prepare_print(
         reason,
         user_settings,
         cwd,
+        session_id,
     })))
 }
 
@@ -522,6 +572,9 @@ pub(crate) fn added_args(config: &Config, profile: &Profile) -> Vec<String> {
 /// `--as`, or the balancer's pick (asking when all are limited), with the
 /// reason for the journal. With `on_limit = wait` a session starts on the
 /// account that resets first and waits there.
+/// The account of a session (`--as`, else the balancer's pick) with its
+/// claim in the run registry, written under the pick lock (DESIGN §6.6).
+#[allow(clippy::too_many_arguments)]
 fn choose(
     ctx: &AppCtx,
     config: &Config,
@@ -530,38 +583,60 @@ fn choose(
     args: &LaunchArgs,
     model: Option<String>,
     tty: bool,
+    busy: bool,
+    cwd: &Path,
 ) -> Result<Option<(Profile, String)>> {
+    let claim = |p: &Profile| {
+        let rec = launch::claim_record(&p.id, args.tool, RunMode::Tui, None, cwd, busy);
+        launch::write_claim(&ctx.paths, &rec);
+        launch::touch_last_used(&ctx.paths, &p.id, unix_now());
+    };
     if let Some(id) = &args.as_profile {
-        return profiles
+        let p = profiles
             .iter()
             .find(|p| &p.id == id)
             .cloned()
-            .map(|p| Some((p, "pinned with --as".into())))
-            .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"));
+            .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"))?;
+        // Under the lock too, so that a pick running now sees it.
+        let _lock = registry::PickLock::acquire(&ctx.paths, launch::PICK_WAIT);
+        claim(&p);
+        return Ok(Some((p, "pinned with --as".into())));
     }
-    let snap = launch::snapshot(ctx, config, profiles, tokens, args.policy, model);
-    if let Some(id) = &snap.pick.chosen {
-        log::info!("pick {id}: {}", snap.pick.reason);
-        return Ok(profiles
-            .iter()
-            .find(|p| &p.id == id)
-            .cloned()
-            .map(|p| (p, snap.pick.reason.clone())));
+    let prefer = crate::affinity::last_account(&ctx.paths, args.tool, &args.tool_args, cwd);
+    let snap = launch::snapshot(ctx, config, profiles, tokens, args.policy, model, prefer);
+    if let Some(p) = snap
+        .pick
+        .chosen
+        .as_ref()
+        .and_then(|id| profiles.iter().find(|p| &p.id == id))
+    {
+        log::info!("pick {}: {}", p.id, snap.pick.reason);
+        claim(p);
+        return Ok(Some((p.clone(), snap.pick.reason.clone())));
     }
-    let Some((label, until)) = snap.pick.earliest_reset.clone() else {
+    drop(snap.lock);
+    let (Some((label, until)), Some(id)) = (
+        snap.pick.earliest_reset.clone(),
+        snap.pick.earliest_id.clone(),
+    ) else {
         bail!("no account to use: {}", snap.pick.reason);
     };
-    let fallback = profiles.iter().find(|p| p.label == label).cloned();
+    let fallback = profiles.iter().find(|p| p.id == id).cloned();
     let resets = format!("{label} resets in {}", fmt_duration(until - snap.ctx.now));
     if config.balance.on_limit == OnLimit::Wait
         && let Some(p) = fallback.clone()
     {
         eprintln!("agp: all pool accounts are limited; {resets}; starting there to wait");
+        claim(&p);
         return Ok(Some((p, format!("all limited, {resets}"))));
     }
     let q = format!("All pool accounts are limited; {resets}. Start on it anyway?");
-    if tty && fallback.is_some() && confirm(&q) {
-        return Ok(fallback.map(|p| (p, format!("all limited, {resets}"))));
+    if tty
+        && let Some(p) = fallback
+        && confirm(&q)
+    {
+        claim(&p);
+        return Ok(Some((p, format!("all limited, {resets}"))));
     }
     eprintln!(
         "agp: all pool accounts are limited; {label} resets in {}",

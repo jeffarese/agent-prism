@@ -119,6 +119,32 @@ pub fn has_session_flag(args: &[String]) -> bool {
     })
 }
 
+/// True if the claude args carry a prompt: a positional, or anything after
+/// `--` (a session started with one works on a turn at once).
+pub fn has_prompt(args: &[String]) -> bool {
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return it.next().is_some();
+        }
+        if !a.starts_with('-') {
+            return true;
+        }
+        if a.contains('=') && a.starts_with("--") {
+            continue;
+        }
+        if matches!(a.as_str(), "-r" | "--resume" | FROM_PR) {
+            // An optional value.
+            if it.peek().is_some_and(|n| !n.starts_with('-')) {
+                it.next();
+            }
+        } else if VALUE_FLAGS.contains(&a.as_str()) {
+            it.next();
+        }
+    }
+    false
+}
+
 /// The args without the user's session flags (and their values) and without
 /// a trailing positional prompt (or anything after `--`). Used when resuming
 /// on another account.
@@ -683,18 +709,39 @@ pub fn load_last_used(paths: &Paths) -> HashMap<String, i64> {
         .unwrap_or_default()
 }
 
-/// Records that a session started on `id` now.
+/// Records that a session started on `id` now. The file is replaced
+/// atomically through a temp file of this process, so concurrent starts
+/// never leave half a file (callers that pick hold the pick lock).
 pub fn touch_last_used(paths: &Paths, id: &str, now: i64) {
     let mut m = load_last_used(paths);
     m.insert(id.to_string(), now);
     let file = paths.state_dir.join("last_used.json");
-    let tmp = file.with_extension("json.tmp");
+    let tmp = paths
+        .state_dir
+        .join(format!(".last_used.{}.tmp", std::process::id()));
     let _ = std::fs::create_dir_all(&paths.state_dir);
     if let Ok(data) = serde_json::to_vec(&m)
         && std::fs::write(&tmp, data).is_ok()
+        && std::fs::rename(&tmp, &file).is_err()
     {
-        let _ = std::fs::rename(&tmp, &file);
+        let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// The live runs per profile id, without this process (DESIGN §6.6):
+/// claims in the run registry, plus background sessions whose job works.
+pub fn run_loads(paths: &Paths, now: i64) -> HashMap<String, registry::Load> {
+    let live = registry::list_live(paths);
+    let mut loads = registry::loads(&live, std::process::id());
+    for profile in crate::bg::running(paths, now) {
+        loads.entry(profile).or_default().add(1.0);
+    }
+    loads
+}
+
+/// How fast `id`'s 5h window fills now (%/h), from the last hour of samples.
+pub fn burn_rate(cache: &UsageCache, id: &str, now: i64) -> Option<f64> {
+    infer::rate_5h(&cache.samples(id, now - infer::LOOKBACK_5H_SECS), now)
 }
 
 /// Balancer inputs for every profile, in config order.
@@ -705,9 +752,9 @@ pub fn account_inputs(
     active: Option<&str>,
     now: i64,
 ) -> Vec<AccountInput> {
-    let me = std::process::id();
-    let live = registry::list_live(paths);
+    let loads = run_loads(paths, now);
     let last = load_last_used(paths);
+    let cache = UsageCache::new(paths.usage_dir());
     tokens.prefetch();
     profiles
         .iter()
@@ -733,10 +780,10 @@ pub fn account_inputs(
                 reserve_7d: p.reserve_7d,
                 identity,
                 token,
-                sessions_elsewhere: live
-                    .iter()
-                    .filter(|r| r.pid != me && r.profile == p.id)
-                    .count() as u32,
+                sessions_elsewhere: loads.get(&p.id).map_or(0, |l| l.runs),
+                load: loads.get(&p.id).map_or(0.0, |l| l.weight),
+                slope_5h: burn_rate(&cache, &p.id, now),
+                run_rate: None,
                 active_here: active == Some(p.id.as_str()),
                 last_used: last.get(&p.id).copied(),
             }
@@ -787,6 +834,8 @@ pub fn view_ctx(
         exclude,
         // Idle accounts are polled every poll_idle_secs; twice that is stale.
         stale_after_secs: 2 * config.usage.poll_idle_secs as i64,
+        run_load: config.balance.run_load.max(0.0),
+        prefer: None,
     }
 }
 
@@ -794,6 +843,7 @@ pub fn view_ctx(
 /// `poll_active_secs`, in parallel, waiting at most `budget`. Fetches that
 /// run late finish in the background.
 pub fn refresh_stale(
+    paths: &Paths,
     cache: &UsageCache,
     config: &Config,
     profiles: &[Profile],
@@ -818,6 +868,8 @@ pub fn refresh_stale(
             continue;
         };
         if tok.is_expired(now) {
+            // An idle login: `token_refresh = "nudge"` refreshes it.
+            crate::nudge::maybe_start(paths, config, p, tok.expires_at, now);
             continue;
         }
         let (cache, id, tx) = (cache.clone(), p.id.clone(), tx.clone());
@@ -838,6 +890,9 @@ pub fn refresh_stale(
     }
 }
 
+/// How long a fetch waits for another process's fetch of the same account.
+const FETCH_WAIT: Duration = Duration::from_secs(5);
+
 fn fetch_one(
     cache: &UsageCache,
     id: &str,
@@ -845,8 +900,21 @@ fn fetch_one(
     now: i64,
 ) -> Result<()> {
     let Some(_lock) = cache.try_lock(id)? else {
+        // Another process fetches this account now: wait for its result,
+        // which the caller then reads from the cache.
+        let deadline = Instant::now() + FETCH_WAIT;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            if cache.try_lock(id)?.is_some() {
+                break;
+            }
+        }
         return Ok(());
     };
+    // Fetched by another process since the caller looked.
+    if cache.load(id).is_some_and(|c| c.last_attempt >= now) {
+        return Ok(());
+    }
     let mut next = cache.load(id).unwrap_or_default();
     next.last_attempt = now;
     next.token_expires_at = tok.expires_at;
@@ -880,9 +948,17 @@ pub struct Snapshot {
     pub usage: HashMap<String, CachedUsage>,
     pub ctx: ViewCtx,
     pub pick: PickResult,
+    /// The pick lock, held until the caller has written its claim (or
+    /// dropped the snapshot). `None` when it timed out.
+    pub lock: Option<registry::PickLock>,
 }
 
-/// Refreshes stale pool usage (2.5 s budget) and picks.
+/// How long a pick waits for the pick of another process.
+pub const PICK_WAIT: Duration = Duration::from_secs(5);
+
+/// Refreshes stale pool usage (2.5 s budget), takes the pick lock and
+/// picks, counting the live runs. `prefer`: a resume's last account. The
+/// caller writes its claim before it drops the snapshot's lock.
 pub fn snapshot(
     app: &AppCtx,
     config: &Config,
@@ -890,26 +966,91 @@ pub fn snapshot(
     tokens: &Arc<KeychainTokens>,
     policy: Option<Policy>,
     model: Option<String>,
+    prefer: Option<String>,
+) -> Snapshot {
+    take_snapshot(app, config, profiles, tokens, policy, model, prefer, true)
+}
+
+/// [`snapshot`] without the pick lock, for `agp status` and `agp pick`
+/// (they claim nothing).
+pub fn preview(
+    app: &AppCtx,
+    config: &Config,
+    profiles: &[Profile],
+    tokens: &Arc<KeychainTokens>,
+    policy: Option<Policy>,
+    model: Option<String>,
+) -> Snapshot {
+    take_snapshot(app, config, profiles, tokens, policy, model, None, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn take_snapshot(
+    app: &AppCtx,
+    config: &Config,
+    profiles: &[Profile],
+    tokens: &Arc<KeychainTokens>,
+    policy: Option<Policy>,
+    model: Option<String>,
+    prefer: Option<String>,
+    lock: bool,
 ) -> Snapshot {
     let now = unix_now();
     let pool: Vec<Profile> = profiles.iter().filter(|p| p.pool).cloned().collect();
     refresh_stale(
+        &app.paths,
         &app.cache,
         config,
         &pool,
         tokens,
         Duration::from_millis(2500),
     );
+    let lock = lock
+        .then(|| registry::PickLock::acquire(&app.paths, PICK_WAIT))
+        .flatten();
     let now = now.max(unix_now());
     let inputs = account_inputs(&app.paths, profiles, tokens, None, now);
     let usage = load_usage(&app.cache, profiles);
-    let ctx = view_ctx(config, policy, model, None, now);
+    let mut ctx = view_ctx(config, policy, model, None, now);
+    ctx.prefer = prefer;
     let pick = balance::pick(&inputs, &usage, &ctx);
     Snapshot {
         inputs,
         usage,
         ctx,
         pick,
+        lock,
+    }
+}
+
+/// This process's claim on `profile` for the run registry.
+pub fn claim_record(
+    profile: &str,
+    tool: Tool,
+    mode: prism_core::journal::RunMode,
+    session_id: Option<String>,
+    cwd: &Path,
+    busy: bool,
+) -> registry::SessionRecord {
+    let pid = std::process::id();
+    registry::SessionRecord {
+        pid,
+        profile: profile.to_string(),
+        session_id,
+        cwd: cwd.to_path_buf(),
+        started_at: unix_now(),
+        switched_at: None,
+        tool,
+        mode,
+        busy,
+        pid_start: registry::process_start(pid),
+    }
+}
+
+/// Writes a claim; a failure is logged (a run never fails for it).
+pub fn write_claim(paths: &Paths, rec: &registry::SessionRecord) {
+    if let Err(e) = registry::write_record(paths, rec) {
+        log::warn!("run registry: {e:#}");
     }
 }
 
@@ -919,6 +1060,18 @@ mod tests {
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prompts() {
+        assert!(has_prompt(&v(&["fix it"])));
+        assert!(has_prompt(&v(&["--model", "opus", "fix it"])));
+        assert!(has_prompt(&v(&["-r", "abc", "go on"])));
+        assert!(has_prompt(&v(&["--add-dir", "/x", "--", "-x"])));
+        assert!(!has_prompt(&v(&["--model", "opus"])));
+        assert!(!has_prompt(&v(&["-r", "abc"])));
+        assert!(!has_prompt(&v(&["--resume=abc", "-n", "lane"])));
+        assert!(!has_prompt(&v(&["--"])));
     }
 
     #[test]

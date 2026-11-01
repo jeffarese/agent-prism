@@ -128,6 +128,21 @@ pub fn resume_target(args: &[String]) -> Option<String> {
     }
 }
 
+/// What `codex resume …` / `codex exec resume …` resumes: `Some(Some(id))`
+/// a session id or name, `Some(None)` the last one (`--last`); `None` for
+/// other lines.
+pub fn resumes(args: &[String]) -> Option<Option<String>> {
+    let pos = positionals(args);
+    let rest = match pos.as_slice() {
+        [(_, "exec" | "e"), (_, "resume"), rest @ ..] | [(_, "resume"), rest @ ..] => rest,
+        _ => return None,
+    };
+    if crate::launch::options(args).iter().any(|a| a == "--last") {
+        return Some(None);
+    }
+    Some(rest.first().map(|(_, id)| (*id).to_string()))
+}
+
 /// `user` with `extra` placed so Codex reads it: after a leading `resume`
 /// or `fork` subcommand, else first.
 pub fn insert_flags(user: &[String], extra: Vec<String>) -> Vec<String> {

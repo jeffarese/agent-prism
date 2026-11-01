@@ -103,6 +103,7 @@ impl<'a> Env<'a> {
         let mut fresh = self.config.clone();
         fresh.usage.poll_active_secs = 30;
         launch::refresh_stale(
+            &self.app.paths,
             &self.app.cache,
             &fresh,
             std::slice::from_ref(p),
@@ -199,18 +200,36 @@ pub fn trusted(env: &Env, target: &Profile, cwd: &Path) -> bool {
     prism_core::trust::trusts(&env.app.paths, target, cwd, repo_root(cwd).as_deref())
 }
 
+/// Claims `p` for the session `s` this process moves (DESIGN §6.6):
+/// sessions that hit a limit together then move to different accounts.
+/// [`relocate`] removes the claim when the move is over.
+fn claim(env: &Env, s: &Session, p: &Profile) {
+    let rec = launch::claim_record(
+        &p.id,
+        Tool::Claude,
+        RunMode::Bg,
+        Some(s.sid.clone()),
+        &s.cwd,
+        true,
+    );
+    launch::write_claim(&env.app.paths, &rec);
+}
+
 /// The accounts to move `s` to, best first: the balancer's picks among
 /// the pool (with the run options) without the current account, only
 /// those that share `projects/` with it and trust the session's folder.
+/// Picked under the pick lock; the first is claimed for the move.
 pub fn candidates(env: &Env, s: &Session) -> Vec<Profile> {
     let pool: Vec<Profile> = env.profiles.iter().filter(|p| p.pool).cloned().collect();
     launch::refresh_stale(
+        &env.app.paths,
         &env.app.cache,
         &env.config,
         &pool,
         &env.tokens,
         Duration::from_millis(2500),
     );
+    let _lock = prism_core::registry::PickLock::acquire(&env.app.paths, launch::PICK_WAIT);
     let now = unix_now();
     let mut inputs = launch::account_inputs(&env.app.paths, &env.profiles, &env.tokens, None, now);
     let usage = launch::load_usage(&env.app.cache, &env.profiles);
@@ -242,6 +261,9 @@ pub fn candidates(env: &Env, s: &Session) -> Vec<Profile> {
             ),
             None => {}
         }
+    }
+    if let Some(first) = out.first() {
+        claim(env, s, first);
     }
     out
 }
@@ -358,6 +380,15 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Removes this process's move claim from the run registry when dropped.
+struct MoveClaim<'a>(&'a prism_core::paths::Paths);
+
+impl Drop for MoveClaim<'_> {
+    fn drop(&mut self) {
+        prism_core::registry::remove_record(self.0, std::process::id());
+    }
+}
+
 /// What a stop-and-resume does.
 pub struct Plan<'p> {
     /// Accounts to try in order; empty: wake the session where it is.
@@ -387,6 +418,8 @@ pub fn relocate(env: &Env, s: &Session, plan: &Plan) -> Outcome {
         r.note = Some(format!("moving ({})", plan.reason));
     });
     let out = relocate_inner(env, s, plan);
+    // The record says where the session runs now; the move's claim goes.
+    let _claim = MoveClaim(paths);
     let journal = env.journal(s.run.as_deref(), s.created_at);
     let now = unix_now();
     match &out {
@@ -529,6 +562,9 @@ fn relocate_inner(env: &Env, s: &Session, plan: &Plan) -> Outcome {
                 Ok(None) => {}
                 Err(e) => log::warn!("bg {short}: {e:#}"),
             }
+        }
+        if !wake {
+            claim(env, s, target);
         }
         match resume_in(env, s, target, (plan.prompt)(target)) {
             Ok(()) if wake => return Outcome::Woke,

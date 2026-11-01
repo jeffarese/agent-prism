@@ -165,6 +165,7 @@ fn refresh_loop(d: &Dash) {
     loop {
         let (config, profiles) = d.config();
         launch::refresh_stale(
+            &d.ctx.paths,
             &d.ctx.cache,
             &config,
             &profiles,

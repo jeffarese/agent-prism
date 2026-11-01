@@ -29,6 +29,7 @@ use crate::cli::{BgCommand, LaunchArgs, RunOptions};
 use crate::launch::unix_now;
 use crate::session::Prepared;
 
+pub(crate) use self::claude::spawn_detached;
 pub(crate) use self::settings::value as settings_value;
 
 /// How long a launch waits for the job's `state.json`.
@@ -69,7 +70,11 @@ pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         reason,
         user_settings,
         cwd,
+        ..
     } = *acct;
+    // The pick's claim holds the account until the session's record
+    // counts it (`running`), and goes when the launch returns.
+    let _claim = LaunchClaim(&ctx.paths);
     if config.share.sync_trust {
         let claude = config.profiles_for(&ctx.paths, Tool::Claude);
         prism_core::trust::sync(&ctx.paths, &profile, &claude);
@@ -137,6 +142,57 @@ pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         note(&format!("recording {short}: {e:#}"));
     }
     Ok(code)
+}
+
+/// Removes the launch's claim from the run registry when dropped.
+struct LaunchClaim<'a>(&'a prism_core::paths::Paths);
+
+impl Drop for LaunchClaim<'_> {
+    fn drop(&mut self) {
+        prism_core::registry::remove_record(self.0, std::process::id());
+    }
+}
+
+/// A launched job counts as running this long before its state is known.
+const JUST_LAUNCHED_SECS: i64 = 120;
+
+/// The profile of every background session agp knows that uses its
+/// account now: a watched (or `stay`) session whose job is working, or that
+/// was launched moments ago. Sessions agp is moving are counted by the
+/// mover's claim. Read-only, for the balancer (DESIGN §6.6).
+pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(record::dir(paths)) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let sid = name.strip_suffix(".json")?;
+            if sid.starts_with('.') {
+                return None;
+            }
+            let r = record::load(paths, sid)?;
+            if r.state != State::Watching || r.short_id.is_empty() {
+                return None;
+            }
+            let dir = r
+                .config_dir
+                .as_ref()
+                .map_or_else(|| paths.home.join(".claude"), PathBuf::from);
+            let working = match job::read_state(&dir, &r.short_id) {
+                Some(st) => st.state == "working",
+                None => now - r.created_at < JUST_LAUNCHED_SECS,
+            };
+            working.then_some(r.profile)
+        })
+        .collect()
+}
+
+/// The account of the background session `id` (a session or short id)
+/// agp knows, for resume affinity.
+pub fn session_profile(paths: &prism_core::paths::Paths, id: &str) -> Option<String> {
+    let r = record::find(paths, id)?;
+    (!r.profile.is_empty()).then_some(r.profile)
 }
 
 /// One stderr note (stdout stays claude's).

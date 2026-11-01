@@ -27,6 +27,8 @@ pub struct PickResult {
     pub reason: String,
     /// When nothing is pickable: label and time of the earliest reset.
     pub earliest_reset: Option<(String, i64)>,
+    /// The profile id of that account.
+    pub earliest_id: Option<String>,
 }
 
 /// Per-account facts the balancer derives from inputs and usage.
@@ -39,6 +41,19 @@ pub(crate) struct Assessed {
     pub limited: Option<Limited>,
     /// In the pool with a usable token.
     pub eligible: bool,
+    /// The 5h use expected within the hour (or by the window's reset) with
+    /// the runs on the account now: measured use plus the larger of the
+    /// recent burn rate and the runs' expected use. Not clamped.
+    pub load_5h: f64,
+    /// What one more run adds to `load_5h`.
+    pub add_5h: f64,
+}
+
+impl Assessed {
+    /// The expected 5h use with one more run on the account.
+    pub fn with_run(&self) -> f64 {
+        self.load_5h + self.add_5h
+    }
 }
 
 /// Formats a duration compactly: "3d4h", "21h", "1h12m", "7m".
@@ -62,6 +77,27 @@ pub fn capacity(input: &AccountInput) -> f64 {
 /// Whether a scoped window label applies to a model id ("claude-fable-5-1" ~ "Fable").
 pub fn model_matches(model: &str, label: &str) -> bool {
     !label.is_empty() && model.to_lowercase().contains(&label.to_lowercase())
+}
+
+/// The hours of new work the 5h window takes before it resets (at most
+/// one: the balancer looks one hour ahead).
+fn horizon_hours(reset_5h: Option<i64>, now: i64) -> f64 {
+    match reset_5h {
+        Some(r) if r > now => ((r - now) as f64 / 3600.0).min(1.0),
+        _ => 1.0,
+    }
+}
+
+/// Percent of this account's 5h window one run uses per hour: the learned
+/// rate, else `run_load` scaled by the plan (a 20x plan fills half as
+/// fast). 0 when the load is off.
+pub fn run_rate(input: &AccountInput, ctx: &ViewCtx) -> f64 {
+    if ctx.run_load <= 0.0 {
+        return 0.0;
+    }
+    input
+        .run_rate
+        .unwrap_or_else(|| ctx.run_load / capacity(input).max(0.1))
 }
 
 pub(crate) fn assess(
@@ -119,6 +155,15 @@ pub(crate) fn assess(
         }
     }
     let eligible = input.in_pool && !matches!(input.token, TokenState::Missing);
+    let (load_5h, add_5h) = if ctx.run_load > 0.0 {
+        let h = horizon_hours(reset_5h, ctx.now);
+        let per_run = run_rate(input, ctx);
+        let claimed = input.load * per_run;
+        let burn = input.slope_5h.map_or(claimed, |s| s.max(claimed));
+        (u5h + burn * h, per_run * h)
+    } else {
+        (u5h, 0.0)
+    };
     Assessed {
         snapshot,
         u5h,
@@ -126,6 +171,8 @@ pub(crate) fn assess(
         reset_7d,
         limited,
         eligible,
+        load_5h,
+        add_5h,
     }
 }
 
@@ -142,14 +189,15 @@ fn slack_term(input: &AccountInput, a: &Assessed, now: i64) -> f64 {
     (slack7(input, a) / days).min(1.0)
 }
 
-/// The smart score (higher is better).
+/// The smart score (higher is better). The 5h terms use the expected use
+/// with this run added, so live runs count.
 pub(crate) fn smart_score(input: &AccountInput, a: &Assessed, ctx: &ViewCtx) -> f64 {
-    let base = 0.45 * (1.0 - a.u5h / 100.0)
+    let u5h = a.with_run();
+    let base = 0.45 * (1.0 - u5h / 100.0)
         + 0.35 * slack_term(input, a, ctx.now)
         + 0.20 * (1.0 - a.u7d / 100.0);
-    let mut score =
-        capacity(input) * input.weight * base - 0.10 * f64::from(input.sessions_elsewhere);
-    if a.u5h >= ctx.settings.soft_5h {
+    let mut score = capacity(input) * input.weight * base;
+    if u5h >= ctx.settings.soft_5h {
         score -= 0.50;
     }
     if a.snapshot.is_none() {
@@ -158,9 +206,10 @@ pub(crate) fn smart_score(input: &AccountInput, a: &Assessed, ctx: &ViewCtx) -> 
     score
 }
 
-/// The headroom metric: `min(100 - u5h, 100 - reserve - u7d)`.
+/// The headroom metric: `min(100 - u5h, 100 - reserve - u7d)`, with the
+/// expected 5h use of this run and the live ones.
 pub(crate) fn headroom(input: &AccountInput, a: &Assessed) -> f64 {
-    (100.0 - a.u5h).min(100.0 - f64::from(input.reserve_7d) - a.u7d)
+    (100.0 - a.with_run()).min(100.0 - f64::from(input.reserve_7d) - a.u7d)
 }
 
 /// The policy's score for display; `None` for order-based policies.
@@ -221,14 +270,15 @@ pub(crate) fn pick_assessed(
             .iter()
             .filter_map(|&i| {
                 let until = assessed[i].limited.as_ref()?.until?;
-                Some((inputs[i].label.clone(), until))
+                Some((i, until))
             })
             .min_by_key(|(_, t)| *t);
         let reason = match (&earliest, considered.is_empty()) {
             (_, true) => "no eligible account".to_string(),
-            (Some((label, t)), _) => {
+            (Some((i, t)), _) => {
                 format!(
-                    "all limited — {label} resets in {}",
+                    "all limited — {} resets in {}",
+                    inputs[*i].label,
                     fmt_duration(t - ctx.now)
                 )
             }
@@ -237,8 +287,19 @@ pub(crate) fn pick_assessed(
         return PickResult {
             chosen: None,
             reason,
-            earliest_reset: earliest,
+            earliest_reset: earliest.map(|(i, t)| (inputs[i].label.clone(), t)),
+            earliest_id: earliest.map(|(i, _)| inputs[i].profile_id.clone()),
         };
+    }
+    let soft = ctx.settings.soft_5h;
+    let fits = |i: usize| assessed[i].with_run() < soft;
+    // A resume goes back to the account that last ran the session while it
+    // has room: its prompt cache is there.
+    if let Some(p) = &ctx.prefer
+        && let Some(&i) = cands.iter().find(|&&i| &inputs[i].profile_id == p)
+        && fits(i)
+    {
+        return chosen(inputs, i, "resumes on the account that last ran it".into());
     }
     let (best, reason) = if cands.len() == 1 {
         let why = if considered.len() > 1 {
@@ -251,10 +312,25 @@ pub(crate) fn pick_assessed(
         (cands[0], why.to_string())
     } else {
         match ctx.settings.policy {
-            Policy::Priority => (cands[0], "first in priority order".to_string()),
+            Policy::Priority => match cands.iter().copied().find(|&i| fits(i)) {
+                Some(i) if i == cands[0] => (i, "first in priority order".to_string()),
+                Some(i) => (i, "first in priority order with 5h room".to_string()),
+                None => (cands[0], "first in priority order".to_string()),
+            },
             Policy::RoundRobin => {
-                let b = *cands.iter().min_by_key(|&&i| lru_key(&inputs[i])).unwrap();
-                let r = if inputs[b].last_used.is_none() {
+                let b = *cands
+                    .iter()
+                    .min_by(|&&a, &&b| {
+                        inputs[a]
+                            .load
+                            .total_cmp(&inputs[b].load)
+                            .then(lru_key(&inputs[a]).cmp(&lru_key(&inputs[b])))
+                    })
+                    .unwrap();
+                let fewer = cands.iter().any(|&i| inputs[i].load > inputs[b].load);
+                let r = if fewer {
+                    "fewest runs now"
+                } else if inputs[b].last_used.is_none() {
                     "not used yet"
                 } else {
                     "least recently used"
@@ -274,11 +350,109 @@ pub(crate) fn pick_assessed(
             }
         }
     };
+    chosen(inputs, best, reason)
+}
+
+fn chosen(inputs: &[AccountInput], i: usize, reason: String) -> PickResult {
     PickResult {
-        chosen: Some(inputs[best].profile_id.clone()),
+        chosen: Some(inputs[i].profile_id.clone()),
         reason,
         earliest_reset: None,
+        earliest_id: None,
     }
+}
+
+/// Where `n` new runs would go now, one pick after the other, each
+/// counting the ones before it (nothing is claimed). Stops at the first
+/// run with no account.
+pub fn plan(
+    inputs: &[AccountInput],
+    usage: &HashMap<String, CachedUsage>,
+    ctx: &ViewCtx,
+    n: usize,
+) -> Vec<PickResult> {
+    let mut inputs = inputs.to_vec();
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let p = pick(&inputs, usage, ctx);
+        let Some(id) = p.chosen.clone() else {
+            out.push(p);
+            break;
+        };
+        if let Some(i) = inputs.iter_mut().find(|i| i.profile_id == id) {
+            i.load += 1.0;
+            i.sessions_elsewhere += 1;
+            i.last_used = Some(ctx.now);
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// The most runs [`capacity`] counts.
+pub const MAX_CAPACITY: u32 = 50;
+
+/// How many more runs the pool takes now before every usable account's
+/// expected 5h use would reach `soft_5h`: each run goes to the account
+/// with the most room. `None` when the load is off (`run_load = 0`).
+pub fn capacity_left(
+    inputs: &[AccountInput],
+    usage: &HashMap<String, CachedUsage>,
+    ctx: &ViewCtx,
+) -> Option<u32> {
+    if ctx.run_load <= 0.0 {
+        return None;
+    }
+    let mut inputs = inputs.to_vec();
+    let mut n = 0;
+    while n < MAX_CAPACITY {
+        let best = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (i, assess(x, usage.get(&x.profile_id), ctx)))
+            .filter(|(_, a)| {
+                a.eligible && a.limited.is_none() && a.with_run() < ctx.settings.soft_5h
+            })
+            .min_by(|(_, a), (_, b)| a.with_run().total_cmp(&b.with_run()));
+        let Some((i, _)) = best else { break };
+        inputs[i].load += 1.0;
+        n += 1;
+    }
+    Some(n)
+}
+
+/// What `agp status --json` adds per account about the runs on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadInfo {
+    pub profile_id: String,
+    /// Live agent-prism runs on the account.
+    pub runs: u32,
+    /// The expected 5h use within the hour with those runs (0–100);
+    /// `None` without usage data.
+    pub load_5h: Option<f64>,
+    /// In the pool, logged in (an expired token counts: the next run
+    /// refreshes it) and not limited.
+    pub usable: bool,
+}
+
+/// [`LoadInfo`] for every input, in input order.
+pub fn load_info(
+    inputs: &[AccountInput],
+    usage: &HashMap<String, CachedUsage>,
+    ctx: &ViewCtx,
+) -> Vec<LoadInfo> {
+    inputs
+        .iter()
+        .map(|i| {
+            let a = assess(i, usage.get(&i.profile_id), ctx);
+            LoadInfo {
+                profile_id: i.profile_id.clone(),
+                runs: i.sessions_elsewhere + u32::from(i.active_here),
+                load_5h: a.snapshot.as_ref().map(|_| a.load_5h.clamp(0.0, 100.0)),
+                usable: a.eligible && a.limited.is_none(),
+            }
+        })
+        .collect()
 }
 
 fn smart_reason(
@@ -303,6 +477,13 @@ fn smart_reason(
             fmt_duration(r - ctx.now),
             slack7(&inputs[b], a) * 100.0
         );
+    }
+    if a.add_5h > 0.0 {
+        let room = 100.0 - a.with_run();
+        if others().all(|&i| 100.0 - assessed[i].with_run() <= room) {
+            return format!("most 5h room ({room:.0}% left with this run)");
+        }
+        return "best overall score".to_string();
     }
     let h5 = 100.0 - a.u5h;
     if others().all(|&i| 100.0 - assessed[i].u5h <= h5) {
@@ -513,5 +694,153 @@ mod tests {
         b.token = TokenState::Expired { since: 0 };
         let p = pick(&[a, b], &HashMap::new(), &c);
         assert_eq!(p.chosen.as_deref(), Some("b"));
+    }
+
+    /// a, b, c at 10%, 30%, 40% of the 5h window, 20% weekly each.
+    fn lanes() -> (Vec<AccountInput>, HashMap<String, CachedUsage>, ViewCtx) {
+        let mut c = ctx(Policy::Smart);
+        c.run_load = 25.0;
+        let now = c.now;
+        let u = HashMap::from([
+            usage("a", 10.0, 20.0, Some(now + 3 * 86_400), now),
+            usage("b", 30.0, 20.0, Some(now + 3 * 86_400), now),
+            usage("c", 40.0, 20.0, Some(now + 3 * 86_400), now),
+        ]);
+        (vec![input("a"), input("b"), input("c")], u, c)
+    }
+
+    fn ids(p: &[PickResult]) -> Vec<&str> {
+        p.iter()
+            .map(|p| p.chosen.as_deref().unwrap_or("-"))
+            .collect()
+    }
+
+    #[test]
+    fn lanes_started_together_spread() {
+        let (inputs, u, c) = lanes();
+        // Without load every run goes to the emptiest account.
+        let mut off = c.clone();
+        off.run_load = 0.0;
+        assert_eq!(ids(&plan(&inputs, &u, &off, 3)), ["a", "a", "a"]);
+        // With it, each run counts: a has the most room, so it takes two.
+        let p = plan(&inputs, &u, &c, 3);
+        assert_eq!(ids(&p), ["a", "b", "a"]);
+        assert_eq!(p[0].reason, "most 5h room (65% left with this run)");
+        // A live run on a (another process) moves the next one to b.
+        let mut busy = inputs.clone();
+        busy[0].load = 1.0;
+        busy[0].sessions_elsewhere = 1;
+        assert_eq!(pick(&busy, &u, &c).chosen.as_deref(), Some("b"));
+        // An idle interactive session weighs a quarter: a still wins.
+        busy[0].load = 0.25;
+        assert_eq!(pick(&busy, &u, &c).chosen.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn burn_rate_counts_use_agp_does_not_see() {
+        let (mut inputs, u, c) = lanes();
+        // a fills at 60%/h (another machine, claude.ai): 10 + 60 + 25 > b's 55.
+        inputs[0].slope_5h = Some(60.0);
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
+        // A slope below what the runs explain does not lower their load.
+        inputs[0].slope_5h = Some(1.0);
+        inputs[0].load = 2.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
+        // A learned rate replaces run_load for that account.
+        let (mut inputs, u, c) = lanes();
+        inputs[0].run_rate = Some(80.0);
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn soon_reset_takes_less_load() {
+        let (mut inputs, mut u, c) = lanes();
+        let now = c.now;
+        // b's window resets in 6 minutes: a run there adds 2.5 points.
+        u.get_mut("b").unwrap().snapshot.as_mut().unwrap().five_hour =
+            Some(prism_core::model::Window {
+                utilization: 30.0,
+                resets_at: Some(now + 360),
+                inferred: false,
+            });
+        inputs[0].load = 1.0;
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(p.chosen.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn capacity_counts_runs_until_soft() {
+        let (inputs, u, c) = lanes();
+        // soft_5h is 80 here: a takes two (35, 60), b one (55), c one (65).
+        assert_eq!(capacity_left(&inputs, &u, &c), Some(4));
+        let mut full = inputs.clone();
+        full[0].load = 3.0;
+        assert_eq!(capacity_left(&full, &u, &c), Some(2));
+        let mut off = c.clone();
+        off.run_load = 0.0;
+        assert_eq!(capacity_left(&inputs, &u, &off), None);
+        let info = load_info(&full, &u, &c);
+        assert_eq!(info[0].load_5h, Some(85.0));
+        assert!(info.iter().all(|i| i.usable));
+    }
+
+    #[test]
+    fn resume_prefers_the_last_account_while_it_has_room() {
+        let (inputs, mut u, mut c) = lanes();
+        c.prefer = Some("c".into());
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("c"), "resumes on the account that last ran it")
+        );
+        // c would end over soft_5h: pick as usual.
+        u.get_mut("c").unwrap().snapshot.as_mut().unwrap().five_hour =
+            Some(prism_core::model::Window {
+                utilization: 70.0,
+                resets_at: None,
+                inferred: false,
+            });
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn order_policies_count_runs() {
+        let (mut inputs, u, mut c) = lanes();
+        c.settings.policy = Policy::RoundRobin;
+        inputs[0].load = 1.0;
+        inputs[1].last_used = Some(c.now - 10);
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("c"), "fewest runs now")
+        );
+        // Priority fills the first account, then spills when it has no room.
+        c.settings.policy = Policy::Priority;
+        inputs[0].load = 2.0;
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("b"), "first in priority order with 5h room")
+        );
+        inputs[0].load = 0.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn earliest_reset_names_the_profile() {
+        let c = ctx(Policy::Smart);
+        let now = c.now;
+        let mut a = input("a");
+        a.label = "Same".into();
+        let mut ua = usage("a", 100.0, 0.0, None, now);
+        ua.1.snapshot
+            .as_mut()
+            .unwrap()
+            .five_hour
+            .as_mut()
+            .unwrap()
+            .resets_at = Some(now + 60);
+        let p = pick(&[a], &HashMap::from([ua]), &c);
+        assert_eq!(p.earliest_id.as_deref(), Some("a"));
     }
 }

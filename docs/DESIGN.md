@@ -38,7 +38,8 @@ proxy setup) is never offered as an account.
 | Config | `~/.config/agent-prism/config.toml` | `AGP_CONFIG_DIR` (dir) |
 | State root | `~/.local/state/agent-prism/` | `AGP_STATE_DIR` |
 | Usage cache | `<state>/usage/<profile>.json` (+ `.lock`, `.samples.jsonl`) | |
-| Live sessions | `<state>/sessions/<pid>.json` | |
+| Run registry (claims) | `<state>/sessions/<pid>.json`, pick lock `<state>/pick.lock` | |
+| Token nudges | `<state>/nudge/<profile>.json` (+ `.lock`, `empty/`) | |
 | Per-run files | `<state>/run/<pid>/` (hook settings, socket `ctl.sock`) | |
 | Log | `<state>/agent-prism.log` (rotated at 2 MB) | `AGP_LOG=debug` |
 | Adopt journals | `<state>/adopt/<ts>-<profile>.json` | |
@@ -75,11 +76,12 @@ countdown_secs = 5
 resume_prompt = "continue"   # first prompt after a limit switch when Claude has work (§9); "" = none
 soft_5h = 90             # new sessions avoid an account at/over this 5h %
 hard = 98                # at/over this % a window counts as limited
+run_load = 25            # % of a 5h window one working run uses per hour at capacity 1.0 (§6.6); 0 = off
 
 [usage]
 poll_active_secs = 60
 poll_idle_secs = 180
-token_refresh = "lazy"   # lazy | direct  (see §6.3; "direct" is not built yet)
+token_refresh = "lazy"   # lazy | nudge | direct  (see §6.3; "direct" is not built)
 
 [dock]
 mode = "auto"            # auto | full | compact | hidden
@@ -320,6 +322,39 @@ Verified 2026-10-15: `claude auth status` does not refresh an expired token
 `https://platform.claude.com/v1/oauth/token` under its own lock
 (`oauth_refresh_lock_*`). The user chose `lazy` as the behavior.
 
+An expired token on an idle account is not a logout: the account stays
+usable, picks treat it like any other (a reset in the past means 0%), and
+the next run on it refreshes the token. `agp status`, the dashboard and the
+skill call it **idle**. A login the server refused (Claude then writes the
+item with no access and no refresh token) reads as no login: such an account
+is never picked and shows `no login`.
+
+`token_refresh = "nudge"` (opt-in, Claude only) keeps idle logins fresh so
+that their usage can be polled. Verified 2026-11-01 with Claude 2.1.316:
+`claude mcp get <unknown name>` fetches the claude.ai connector list before
+it looks the name up; that fetch refreshes an expired token through Claude's
+locked refresh path, then the unknown name ends the command (exit 1). It
+starts no MCP server and makes no model call; tested live on one account
+(token 6 h expired → valid for 8 h, usage fresh, no 5h window opened).
+`claude mcp list` is not used: it health-checks every server.
+
+- `refresh_stale` (launch picks, `agp status`, the dashboard's refresh loop,
+  limit checks) starts a nudge for a pool Claude account whose token expired,
+  when the last nudge of that account was 30 min ago or more
+  (`<state>/nudge/<id>.json`, decided under `<id>.lock`).
+- The nudge is a detached `agp _nudge <id>`: under the lock, if the token
+  is still expired, it runs `claude mcp get agp-refresh-probe` with the
+  account's `CLAUDE_CONFIG_DIR`, in the empty folder `<state>/nudge/empty`,
+  all output dropped, killed after 60 s. Then it reads the expiry again
+  (only `expiresAt`, never the secret), records before/after, and on success
+  polls the account's usage at once. agent-prism still never writes the
+  Keychain.
+- It needs the GUI login session: over SSH the Keychain can't be read, the
+  token shows as unreadable and no nudge starts. `AGP_NO_POLL` turns it off.
+- If a later Claude stops refreshing there, nothing breaks: the token stays
+  expired, the log says so, and the next run refreshes it. A refused refresh
+  leaves the item empty, which reads as no login (above).
+
 ### 6.4 Cache and polling
 
 Each agent-prism process polls in a background thread. Before a fetch it reads
@@ -329,6 +364,11 @@ fetches, writes atomically, and appends `{ts,u5h,u7d}` to `.samples.jsonl`
 (keep the last 7 days). Active profile: `poll_active_secs`; others:
 `poll_idle_secs`. A "refresh now" request ignores the age.
 
+A launch's refresh (`refresh_stale`, 2.5 s budget) does not skip a locked
+account: it waits (up to 5 s) for the other process's fetch and then reads
+its result, and it does not fetch again what another process fetched since
+it looked. So lanes that start together pick on the same fresh numbers.
+
 ### 6.5 Inference and projection
 
 - If a window's `resets_at` is in the past, its utilization is 0 and its
@@ -336,34 +376,97 @@ fetches, writes atomically, and appends `{ts,u5h,u7d}` to `.samples.jsonl`
 - Projection: from samples in the last 60 min (5h window) or 6 h (7d window),
   weighted toward recent samples, project the utilization at reset. Needs
   ≥ 10 min of span, else none.
+- Burn rate (`infer::rate_5h`): the same weighted slope of the last hour's
+  5h samples after the last reset, in %/h, never negative; none with fewer
+  than 3 samples, under 10 min of span, or a newest sample older than 15
+  min. It counts all use of the account, also from outside agent-prism
+  (claude.ai, another machine).
 
 ### 6.6 Balancer
 
 Input: `AccountView`s for pool profiles, the model in use (for scoped
-windows), sessions per profile from the live-session registry.
+windows), the live runs per profile from the run registry (claims, below),
+and each account's 5h burn rate (§6.5).
+
+**Claims.** Every run agent-prism starts holds a record in the run registry
+`<state>/sessions/<pid>.json` (`SessionRecord`: profile, tool, mode, busy,
+session id, cwd, the pid's start time) while it runs, in every mode:
+
+| Run | Claim | Weight |
+| --- | --- | --- |
+| interactive `agp` (Claude) | written at the pick, kept by the host, removed at exit | 1 while a turn runs (`UserPromptSubmit` → `Stop`, or started with a prompt), else 0.25 |
+| interactive `agp codex` | the same | 0.5 (no hooks tell whether it works) |
+| `agp -p`, `agp codex exec` (exec'd) | written before `exec`; the tool keeps the pid | 1 |
+| supervised print (`--on-limit`) | written at the pick, moved with the run, removed at the end | 1 |
+| `agp --bg` launch | from the pick until the session's record exists | 1 |
+| watched background session | none: derived from `<state>/bg` (state `watching`, job `working`, or launched < 2 min ago) | 1 |
+| background move | the watcher (or `agp bg move`) claims each target it tries, until the record says where the session runs | 1 |
+| limit switch countdown/question (interactive) | the host's claim names the target until the switch or a cancel | as above |
+
+Runs pinned with `--as` claim too. A record whose pid is gone, or whose pid
+now belongs to a process that started at another time (a reused pid), is
+deleted when the registry is read. Records of older versions read as busy
+interactive Claude sessions.
+
+**Pick lock.** A pick that writes a claim holds the exclusive `flock` on
+`<state>/pick.lock` from reading the claims to writing its own (5 s wait;
+on timeout it picks without the lock, a launch never fails for it). The
+usage refresh runs before the lock. Limit switches, supervised moves and
+background moves pick under it too, so runs that hit a limit together move
+to different accounts. `agp status` and `agp pick` don't take it.
+
+**Expected load.** Per account, with `h = min(1, hours to the 5h reset)`
+(1 when unknown) and `r = run_load / cap` (the rate of one working run on
+this plan, `%/h`):
+
+```
+load_5h  = u5h + max(burn_rate, Σ weights of the other runs × r) × h
+with_run = load_5h + r × h        (this run added)
+```
+
+`balance.run_load` (default 25, 0 turns all of this off) is 25% of a 5h
+window per working-run hour on a capacity-1.0 plan. One user's history
+(2026-11-01, ~420 run-hours over 5 accounts) is consistent with it: open
+sessions average ~5%/h (mostly idle: 0.25 × 25 ≈ 6), a session's first hour
+~14%/h (about 40% of it working). A per-account rate learned from the
+journal was tried and left out: the journal has no busy time, so it measures
+open sessions, not working runs, and would undercount lanes; the burn-rate
+term already adapts to what an account really uses.
 
 - **Limited**: `u5h >= hard`, or `u7d >= 100 - reserve_7d`, or a scoped
   window for the session's model `>= hard`. Limited accounts are never
-  picked.
+  picked. Measured use only (not `load_5h`).
 - **smart** score, highest wins:
   ```
   slack7 = max(0, 100 - reserve_7d - u7d) / 100
   days   = max(0.25, hours_to_7d_reset / 24)       (unknown reset → 7)
-  score  = cap * weight * ( 0.45 * (1 - u5h/100)
+  score  = cap * weight * ( 0.45 * (1 - with_run/100)
                           + 0.35 * min(1, slack7 / days)
                           + 0.20 * (1 - u7d/100) )
-         - 0.10 * sessions_elsewhere
-         - (u5h >= soft_5h ? 0.50 : 0)
+         - (with_run >= soft_5h ? 0.50 : 0)
          - (usage unknown ? 0.15 : 0)
   cap = 2.0 for "20x" tiers, 1.0 for "5x" and team, 0.4 for pro, else 1.0
   ```
-  Tie → least recently used.
-- **priority**: first eligible in config order (fill one, then spill).
-- **round-robin**: least recently used eligible.
-- **headroom**: max of `min(100-u5h, 100-reserve-u7d)`.
+  Tie → least recently used. With `run_load = 0`, `with_run = u5h`.
+- **priority**: first eligible in config order whose `with_run` stays
+  under `soft_5h` (fill one, then spill); none → the first.
+- **round-robin**: fewest runs (summed weights), then least recently used.
+- **headroom**: max of `min(100 - with_run, 100 - reserve - u7d)`.
+- **Resume affinity**: a line that resumes a conversation starts on the
+  account that ran it last when that account is not limited and its
+  `with_run` stays under `soft_5h` (its prompt cache is there): Claude
+  `--resume <uuid>` / `-r <uuid>` / `-c` (the last session agp ran in this
+  folder), Codex `resume <id>` / `exec resume <id>` / `--last`. The account
+  comes from the background record, else the journal (§11b). `--as` wins.
 - Every pick has a one-line reason, e.g. "weekly resets in 21h with 28%
-  unused", "most 5h headroom", "the only account not limited".
-- All limited → no pick; report the earliest reset.
+  unused", "most 5h room (40% left with this run)", "fewest runs now",
+  "resumes on the account that last ran it", "the only account not limited".
+- All limited → no pick; report the earliest reset (label and profile id).
+- **Plan and capacity** (`agp pick --n`, `agp status`): `plan(n)` picks
+  `n` times, each pick counting the ones before (nothing is claimed).
+  `capacity` is how many more working runs fit before every usable
+  account's `with_run` would reach `soft_5h`, each going to the account
+  with the most room (at most 50; `null` when `run_load = 0`).
 - Mid-session agent-prism never switches for balance alone — only on a limit or
   a manual switch (prompt cache is per account; a switch re-reads context).
 
@@ -436,7 +539,11 @@ Throttle draws to ≤ 20/s; draw within one frame after output goes quiet
   stderr note, then plain claude. All accounts limited: one stderr note, then
   the earliest-reset account. Overlay and user `--settings` are merged into
   one JSON value (user wins); if that fails the user value goes through. Same
-  inside an agent-prism session (nested).
+  inside an agent-prism session (nested). Without a user session flag,
+  Claude print mode gets `--session-id <uuid v4>` too, which the journal's
+  start event records (a resume records the session it resumes), for resume
+  affinity (§6.6) and the dashboard. The run's claim is written before the
+  `exec` and stays for the tool's lifetime (same pid).
 - Print mode with `--on-limit` (§11a): agent-prism stays the parent
   (`supervise.rs`) instead of exec'ing the tool.
 - `--bg` among the claude args (before any `--`): a Claude Code background
@@ -536,8 +643,10 @@ Triggers: `StopFailure` with `error == rate_limit` (refresh usage of the
 active account at once); a poll that shows the active account limited; the
 user ("Switch account now" in the menu, pick a target or "best").
 
-1. Target = balancer pick excluding the current account (or the user's).
-   None → status message with the earliest reset; stop.
+1. Target = balancer pick excluding the current account (or the user's),
+   under the pick lock with fresh claims (§6.6). The session's claim names
+   the target from now until the switch, or goes back on a cancel or a
+   refused switch. None → status message with the earliest reset; stop.
 2. `on_limit`: `auto` → countdown (`countdown_secs`; ⏎ now, Esc cancel);
    `ask` → prompt in the status row; `stay` → message only; `wait` → no
    target: stay on the account until its reset + 30 s (unknown reset: check
@@ -568,10 +677,11 @@ user ("Switch account now" in the menu, pick a target or "best").
 7. Requires shared `projects/` in both profiles; else the switch item is
    disabled with "run agp adopt <id>".
 
-Live-session registry `<state>/sessions/<pid>.json`
-(`{pid, profile, session_id, cwd, started_at}`); dead pids are ignored and
-removed. It gives "used by another agent-prism" and the balancer's
-`sessions_elsewhere`.
+Run registry `<state>/sessions/<pid>.json` (`{pid, profile, session_id,
+cwd, started_at, switched_at, tool, mode, busy, pid_start}`; all runs, not
+only interactive ones, §6.6); records of dead or reused pids are removed.
+It gives "used by another agent-prism", the balancer's runs and load, the
+dashboard's live runs and `agp status`'s RUNS.
 
 ## 10. Menu, settings, onboarding (`agp` bin)
 
@@ -612,12 +722,14 @@ left step rail + content + key hints:
 ```
 agp [--as <id>] [--policy <p>] [--dock <mode>] [claude args...]
 agp codex [--as <id>] [--policy <p>] [--dock <mode>] [codex args...]
-agp status [--json] [--watch]
-agp pick [--json] [--codex]
+agp status [--json] [--watch]    RUNS per account, room left; JSON: views[].runs/load_5h/usable, capacity
+agp pick [--json] [--codex] [--n <k>]   --n: where k new runs would go (nothing claimed)
 agp add [--codex | --claude] [id]
 agp settings | setup | doctor
 agp dashboard [--port <n>] [--no-open]
-agp skill [install]             print or install the agp skill (§11a)
+agp skill [show]                print the agp skill (SKILL.md; §11e)
+agp skill install [--agent <a>] [--dir <path>]
+agp skill list | uninstall [--agent <a>] [--dir <path>]
 agp adopt <id|dir> [--apply] [--no-backup] [--force]
 agp exec <id> -- <cmd...>       run a command with that profile's env
 agp [opts] --bg [claude args]   a Claude Code background session (§11d)
@@ -625,6 +737,7 @@ agp bg [--json]                 background sessions and their watchers
 agp bg watch <session> [--as <id>] [--policy <p>] [per-run opts]
 agp bg move <session> [--to <id>] [--json]
 agp bg _watch <session id>      internal (the detached watcher)
+agp _nudge <id>                 internal (a detached token nudge, §6.3)
 agp hook <Event>                internal
 ```
 
@@ -693,7 +806,8 @@ supervised print mode, `bg` = a background session: the launch writes
 job is gone), `profile`, and when they apply `from`, `limit`
 (`5h | 7d | scoped`), `until`, `reason`, `session`, `cwd`, `exit`, `secs`.
 A line is one `write` in append mode, so processes don't interleave. Errors
-are logged and never fail a run.
+are logged and never fail a run. A run is live while its claim is in the
+run registry (all modes, §6.6), so the dashboard sees running print runs.
 
 ## 11c. Dashboard (`agp dashboard`)
 
@@ -966,6 +1080,73 @@ limit, in the foreground within about 60 s (the watch's options apply to
 the target choice). `--json` prints `{"moved": true, "session_id",
 "short_id", "from", "from_label", "to", "to_label", "to_config_dir"}`;
 a failure exits 1 with the reason on stderr.
+
+## 11e. Skills (`agp skill`)
+
+Code: `crates/agent-prism/src/skill.rs`; the skill is
+`crates/agent-prism/skills/agp/` (`SKILL.md` plus `reference/lanes.md`,
+`background.md`, `status.md`), embedded with `include_str!` (`FILES`), so
+an install always matches the binary. A test checks that `FILES` and the
+folder hold the same files, that `SKILL.md` links every reference page and
+that the frontmatter follows the Agent Skills rules (only `name` and
+`description`; `name` = folder name, lowercase, ≤ 64; description ≤ 1024
+characters; Codex rejects other keys).
+
+**Targets** (`--agent` names; confirmed in each agent's docs, and for
+Claude Code 2.1.316 and Codex 0.165.0 in the binaries):
+
+| Agent | Skills folder | Auto |
+| --- | --- | --- |
+| `claude` | `<common_home>/skills` | common home exists |
+| `codex` | `<codex.common_home>/skills` | common home exists |
+| `gemini` | `~/.gemini/skills` | `~/.gemini` exists |
+| `copilot` | `~/.copilot/skills` | `~/.copilot` exists |
+| `droid` | `~/.factory/skills` | `~/.factory` exists |
+| `agents` | `~/.agents/skills` | never (only `--agent agents`) |
+| `amp`, `opencode`, `cursor`, `goose` | Claude's folder (they read `~/.claude/skills`) | no own copy |
+
+One copy per folder an agent reads, so an agent never lists the skill
+twice: Amp, OpenCode, Cursor and Goose read `~/.claude/skills`, and Codex
+reads `~/.agents/skills` besides `$CODEX_HOME/skills` (which its source
+marks deprecated; if Codex drops it, `codex` moves to `~/.agents/skills`).
+Sources: code.claude.com/docs/en/skills, learn.chatgpt.com/docs/build-skills
+(and `codex-rs/ext/skills/src/host_roots.rs`), geminicli.com/docs/cli/skills,
+docs.github.com (Copilot CLI, add skills), docs.factory.com/cli/configuration/skills,
+ampcode.com/docs/customize/skills, opencode.ai/docs/skills,
+cursor.com/docs/context/skills, goose-docs.ai (using skills).
+
+**Commands.** `agp skill [show]` prints `SKILL.md`. `install` without
+names takes the auto targets that are detected; `--agent` (repeatable,
+comma lists) takes those, creating the folder; `--dir <path>` takes
+`<path>/agp` (the path must exist). `list` (`status`) prints each known
+target, its folder and its state (`current`, `outdated`, `not installed`,
+`not agp's`, a link, `reads the claude copy`). `uninstall` without names
+takes every agent's own folder. One line per target: `installed |
+updated | up to date | removed | not there | skipped | failed` and the
+path. Exit 1 when a target was skipped or failed.
+
+**Ownership.** agp writes `.agp-skill.json` (`{"skill": "agp", "by":
+"agent-prism", "files": [...]}`) into `<skills dir>/agp`. A folder is
+agp's when it has that manifest, holds only an agp `SKILL.md` (the
+one-file layout of older agp versions), or is empty. Anything else is left
+alone (skipped).
+
+**Install rules.**
+
+- Each file is written to a temp file in its folder and renamed, only
+  when its content differs. The manifest goes last.
+- Files the old manifest (or the one-file layout) lists that the skill no
+  longer has are removed, then their folders left empty; only plain
+  relative paths inside `<skills dir>/agp` count. Files agp did not write
+  stay.
+- Symlinks are never followed out of the target: a symlinked folder inside
+  `agp/` fails that target; a symlinked file is replaced by the new file.
+  `<skills dir>/agp` as a symlink is skipped unless it points at a folder
+  agp manages; then agp writes into that folder, once per run (folders are
+  compared by canonical path, so two targets that reach one folder print
+  `up to date (same folder as …)`).
+- Uninstall removes the files agp wrote and the manifest, then the folder
+  if nothing else is in it; a symlink is left as it is.
 
 ## 12. Codex (ChatGPT plans)
 

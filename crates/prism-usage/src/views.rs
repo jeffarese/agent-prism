@@ -22,8 +22,18 @@ pub struct AccountInput {
     pub reserve_7d: u8,
     pub identity: AccountIdentity,
     pub token: TokenState,
-    /// Live agent-prism sessions on this account in other processes.
+    /// Live agent-prism runs on this account in other processes (claims
+    /// from the run registry and watched background sessions).
     pub sessions_elsewhere: u32,
+    /// Their weight for the balancer: a working run is 1, an idle
+    /// interactive session a quarter.
+    pub load: f64,
+    /// The 5h burn rate in this account's usage samples of the last hour,
+    /// percent per hour (all use, also from outside agent-prism).
+    pub slope_5h: Option<f64>,
+    /// Learned percent of this account's 5h window one run uses per hour;
+    /// `None`: `run_load` scaled by the plan.
+    pub run_rate: Option<f64>,
     /// This agent-prism session runs on this account.
     pub active_here: bool,
     /// When a session last started on this account (unix seconds).
@@ -41,6 +51,12 @@ pub struct ViewCtx {
     pub exclude: Option<String>,
     /// Usage older than this is shown as stale.
     pub stale_after_secs: i64,
+    /// `balance.run_load`: percent of a 5h window one run uses per hour on
+    /// a capacity-1.0 plan; 0 turns the load off.
+    pub run_load: f64,
+    /// Start on this account when it is usable and has room (a resume on
+    /// the account that last ran the session).
+    pub prefer: Option<String>,
 }
 
 fn status(cached: Option<&CachedUsage>, ctx: &ViewCtx) -> UsageStatus {
@@ -145,6 +161,9 @@ pub(crate) mod tests {
                 expires_at: i64::MAX,
             },
             sessions_elsewhere: 0,
+            load: 0.0,
+            slope_5h: None,
+            run_rate: None,
             active_here: false,
             last_used: None,
         }
@@ -161,6 +180,8 @@ pub(crate) mod tests {
             },
             exclude: None,
             stale_after_secs: 600,
+            run_load: 0.0,
+            prefer: None,
         }
     }
 

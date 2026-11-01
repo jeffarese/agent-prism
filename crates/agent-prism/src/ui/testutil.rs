@@ -159,6 +159,7 @@ pub fn live() -> Live {
             chosen: Some("b".into()),
             reason: "most 5h headroom".into(),
             earliest_reset: None,
+            earliest_id: None,
         }),
         session: Some(SessionInfo {
             tool: Default::default(),

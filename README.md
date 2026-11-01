@@ -79,8 +79,10 @@ agp --bg "task"         # a Claude Code background session; limits handled
 agp bg                  # background sessions agp watches (--json)
 agp status              # usage table of all accounts (--json, --watch)
 agp dashboard           # usage, history and runs in the browser
-agp skill install       # teach Claude and Codex agents to use agp
+agp skill install       # teach Claude, Codex and other agents to use agp
+agp skill list          # where the agp skill is installed, and if it is current
 agp pick --codex        # the ChatGPT account a new session would use
+agp pick --n 4          # where 4 new runs would go (each counts the ones before)
 agp settings            # settings, full screen
 agp add [id]            # add an account; asks Claude or Codex, then logs in
 agp add --codex [id]    # add a ChatGPT account (creates ~/.codex-<id>)
@@ -123,6 +125,42 @@ does not start the TUI runs this way: `exec` (`e`), `review`, `login`,
 `mcp`, `--help` and the other subcommands, but not `resume` and `fork`.
 All Codex accounts use one thread database, so `exec resume` finds a thread
 that another account started.
+
+## Parallel lanes
+
+Start every lane without `--as`; agent-prism spreads them, even lanes started
+in the same second:
+
+```sh
+agp status              # RUNS per account, and room for more runs
+agp pick --n 3          # where 3 new runs would go
+for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & done; wait
+```
+
+- Every run holds a claim on its account while it runs: interactive
+  sessions, `agp -p`, `agp codex exec`, supervised runs, `--bg` sessions,
+  and runs pinned with `--as`. Picks are serialized (a file lock), so lanes
+  that start together see each other.
+- A working run counts as `balance.run_load` (default 25) percent of the 5h
+  window per hour on a 5x/team plan (half that on 20x), on top of the
+  account's measured use and its burn rate over the last hour (which also
+  sees use from claude.ai or another machine). An interactive session that
+  waits for you counts a quarter. With accounts at 10%, 30% and 40%, three
+  lanes go a, b, a instead of a, a, a.
+- `agp status --json` has `runs`, `load_5h` (expected 5h use one hour from
+  now) and `usable` per account, and `capacity`: how many more runs fit
+  before every account nears `soft_5h`.
+- Moves on a limit are spread the same way.
+- `agp -p` gives each Claude run a session id. A resume (`--resume <id>`,
+  `-c`, `codex exec resume`) starts on the account that last ran that
+  conversation, where its prompt cache is, if it is not limited and has room.
+- `idle` in `agp status` (older versions: `expired`) means nothing used the
+  account for hours, so its access token ran out. It is still logged in and
+  usable; the next run there refreshes the token. Only `no login` needs a
+  new login. To keep idle tokens fresh, set `[usage] token_refresh =
+  "nudge"`: agent-prism then runs `claude mcp get <made-up name>` on an idle
+  account now and then, which refreshes the token without a model call
+  (needs your desktop session; it can't read the Keychain over SSH).
 
 ## Per-run options
 
@@ -208,14 +246,73 @@ from yours on every move and on `agp bg watch`, so rewrite your file and
 run `agp bg watch <id>` before a `claude respawn` to give the session new
 hooks.
 
-## Agents: the agp skill
+## Skills for agents
 
-`agp skill install` writes an `agp` skill to `~/.claude/skills/agp` and
-`~/.codex/skills/agp`. All accounts of a tool share that dir, so every
-Claude and Codex agent knows to use `agp -p` / `agp codex exec`, the
-per-run options and `agp status` without finding them out again. Run it
-again after an update (it says "up to date" when nothing changed);
-`agp skill` prints the text.
+agp ships an Agent Skill, `agp`, that teaches coding agents to run Claude
+Code and Codex through agp. With it an agent:
+
+- puts `agp` in front of `claude -p`, `claude --bg` and `codex exec`
+- starts parallel lanes without `--as`, so agp spreads them, and checks
+  `capacity` in `agp status --json` before a big fan-out
+- uses `--on-limit`, `--max-wait` and `agp --bg` for long runs, and knows
+  that exit code 75 means "limited, retry later"
+- continues a conversation with `agp -p --resume <session_id>`
+- reads `agp status`: an `idle` (or `expired`) account is still logged in;
+  only `no login` needs you
+- leaves `agp settings`, `agp setup`, `agp add` and `agp adopt --apply` to
+  you.
+
+The skill is a folder: a short `SKILL.md` and `reference/` pages for
+lanes, background sessions and status. The text is built into `agp`, so an
+install always matches the binary.
+
+```sh
+agp skill install                  # every agent found on this Mac
+agp skill install --agent gemini   # only these (repeat it or use a,b)
+agp skill install --dir ~/my-agent/skills   # any Agent Skills folder: <dir>/agp
+agp skill list                     # each target, and whether its copy is current
+agp skill                          # print SKILL.md
+agp skill uninstall                # remove the copies agp installed (--agent, --dir)
+```
+
+Each target prints `installed`, `updated` or `up to date` and the path.
+
+| Agent | `--agent` | Where the skill lands | By default |
+| --- | --- | --- | --- |
+| Claude Code | `claude` | `~/.claude/skills/agp` (the common home, `common_home`) | yes |
+| Codex CLI | `codex` | `~/.codex/skills/agp` (`codex.common_home`) | yes |
+| Gemini CLI | `gemini` | `~/.gemini/skills/agp` | when `~/.gemini` exists |
+| GitHub Copilot CLI | `copilot` | `~/.copilot/skills/agp` | when `~/.copilot` exists |
+| Factory Droid | `droid` | `~/.factory/skills/agp` | when `~/.factory` exists |
+| Amp, OpenCode, Cursor, Goose | `amp`, `opencode`, `cursor`, `goose` | they read `~/.claude/skills`, so the Claude copy serves them | with Claude |
+| Agents that read `~/.agents/skills` | `agents` | `~/.agents/skills/agp` | only with `--agent agents` |
+| Any other agent | `--dir <skills dir>` | `<skills dir>/agp` | no |
+
+All accounts of a tool share its common home, so every Claude and Codex
+account sees the skill. agp installs one copy per folder an agent reads:
+Codex also reads `~/.agents/skills`, so a copy there too (`--agent
+agents`) shows the skill twice in Codex. Use it for an agent that reads
+only `~/.agents/skills`.
+
+agp writes `.agp-skill.json` into the folder it installs, with the list of
+its files. It updates, prunes and removes only a folder with that file (or
+the one-file `SKILL.md` an older agp wrote), and only the files on that
+list. A `<skills dir>/agp` that agp did not install, or a symlink to a
+folder agp does not manage, is reported and left alone.
+
+**Update.** Run `agp skill install` again after you upgrade agp. It
+rewrites what changed and removes files an older version wrote that the
+skill no longer has; `up to date` means nothing changed.
+
+**Manual install.** Copy the folder
+[`crates/agent-prism/skills/agp`](crates/agent-prism/skills/agp) into the
+agent's skills folder as `agp`, or run `agp skill install --dir <skills
+dir>`. A manual copy has no `.agp-skill.json`, so `agp skill` won't touch
+it: delete it yourself, or remove it once and let `agp skill install`
+manage the folder.
+
+**Uninstall.** `agp skill uninstall` removes agp's files from every
+target (`--agent`, `--dir` for some). Files you added to the folder stay.
 
 ## Dashboard
 

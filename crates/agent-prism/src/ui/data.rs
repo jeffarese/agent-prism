@@ -38,6 +38,8 @@ fn view_ctx(config: &Config) -> ViewCtx {
         settings: balance_settings(config),
         exclude: None,
         stale_after_secs: (config.usage.poll_idle_secs as i64) * 2,
+        run_load: config.balance.run_load.max(0.0),
+        prefer: None,
     }
 }
 
@@ -84,6 +86,9 @@ fn input_for(
         identity,
         token,
         sessions_elsewhere: 0,
+        load: 0.0,
+        slope_5h: None,
+        run_rate: None,
         active_here: false,
         last_used: None,
     }
@@ -149,6 +154,9 @@ pub fn preview_pick(config: &Config, views: &[AccountView]) -> PickResult {
                 identity: v.map(|v| v.identity.clone()).unwrap_or_default(),
                 token: v.map(|v| v.token.clone()).unwrap_or(TokenState::Missing),
                 sessions_elsewhere: v.map_or(0, |v| v.active_elsewhere),
+                load: v.map_or(0.0, |v| f64::from(v.active_elsewhere)),
+                slope_5h: None,
+                run_rate: None,
                 active_here: v.is_some_and(|v| v.active_here),
                 last_used: None,
             }

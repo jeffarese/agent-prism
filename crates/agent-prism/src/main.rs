@@ -12,6 +12,7 @@
 
 mod actions;
 mod adopt_cmd;
+mod affinity;
 mod app;
 mod bg;
 mod cli;
@@ -23,6 +24,7 @@ mod host;
 mod launch;
 mod live;
 mod logging;
+mod nudge;
 mod session;
 mod skill;
 mod status;
@@ -75,7 +77,8 @@ fn run(args: Vec<OsString>) -> Result<i32> {
     match cmd {
         Command::Launch(l) => session::run(ctx, l),
         Command::Status { json, watch } => status::run_status(ctx, json, watch),
-        Command::Pick { json, tool } => status::run_pick(ctx, json, tool),
+        Command::Pick { json, tool, n } => status::run_pick(ctx, json, tool, n),
+        Command::Nudge { id } => nudge::run(&ctx, &id),
         Command::Settings => ui::run_settings(ctx).map(|()| 0),
         Command::Setup => ui::run_onboarding(ctx).map(|_| 0),
         Command::Dashboard { port, open } => dashboard::run(ctx, port, open),

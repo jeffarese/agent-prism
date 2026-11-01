@@ -130,9 +130,17 @@ pub enum Command {
         json: bool,
         watch: bool,
     },
+    /// `agp _nudge <id>`: refresh an idle Claude login (internal, detached;
+    /// `token_refresh = "nudge"`).
+    Nudge {
+        id: String,
+    },
+    /// `agp pick [--json] [--codex] [--n <k>]`.
     Pick {
         json: bool,
         tool: Tool,
+        /// Plan `k` runs, each counting the ones before it.
+        n: Option<usize>,
     },
     Settings,
     Setup,
@@ -141,9 +149,11 @@ pub enum Command {
         port: Option<u16>,
         open: bool,
     },
-    /// `agp skill [install|show]`: the agp skill for Claude and Codex.
+    /// `agp skill [show | install | list | uninstall]`: the agp skill for
+    /// agents (§11e). The field keeps its old name so `main.rs` matches it
+    /// unchanged; it holds the whole subcommand.
     Skill {
-        install: bool,
+        install: SkillCmd,
     },
     Add {
         id: Option<String>,
@@ -165,6 +175,27 @@ pub enum Command {
     Hook(String),
     Help,
     Version,
+}
+
+/// `agp skill …` subcommands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SkillCmd {
+    /// `agp skill [show]`: print SKILL.md.
+    Show,
+    /// `agp skill install [--agent <names>] [--dir <path>]`.
+    Install(SkillTargets),
+    /// `agp skill list` (or `status`): every known target and its state.
+    List,
+    /// `agp skill uninstall [--agent <names>] [--dir <path>]`.
+    Uninstall(SkillTargets),
+}
+
+/// The targets named with `--agent` (repeatable, comma lists) and `--dir`;
+/// both empty means every detected agent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SkillTargets {
+    pub agents: Vec<String>,
+    pub dirs: Vec<String>,
 }
 
 /// `agp bg …` subcommands.
@@ -198,11 +229,19 @@ Usage:
   agp codex [--as <id>] [--policy <p>] [--dock <mode>] [codex args...]
                                       the same for Codex (ChatGPT plans)
   agp status [--json] [--watch]     usage of all accounts
-  agp pick [--json] [--codex]       the account a new session would use
+  agp pick [--json] [--codex] [--n <k>]
+                                      the account a new session would use; --n: the
+                                      next k runs, each counting the ones before
   agp settings                      settings (full screen)
   agp dashboard [--port <n>] [--no-open]
                                       usage dashboard in the browser
-  agp skill [install]               show or install the agp skill for agents
+  agp skill [show]                  print the agp skill for agents (SKILL.md)
+  agp skill install [--agent <a>] [--dir <path>]
+                                      install it for every detected agent
+                                      (Claude, Codex, ...), or these only
+  agp skill list                    where the skill goes and if it is current
+  agp skill uninstall [--agent <a>] [--dir <path>]
+                                      remove the copies agp installed
   agp setup                         first-run setup
   agp add [--codex] [id]            add an account and log in
   agp doctor                        check the setup
@@ -380,13 +419,38 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
             json: has("--json"),
             watch: has("--watch"),
         },
-        "pick" => Command::Pick {
-            json: has("--json"),
-            tool: if has("--codex") {
-                Tool::Codex
-            } else {
-                Tool::Claude
-            },
+        "pick" => {
+            let mut n = None;
+            let mut it = rest().into_iter();
+            while let Some(a) = it.next() {
+                let v = match a.as_str() {
+                    "--json" | "--codex" => continue,
+                    "--n" | "-n" => it.next(),
+                    _ if a.starts_with("--n=") => Some(a["--n=".len()..].to_string()),
+                    _ => bail!("usage: agp pick [--json] [--codex] [--n <runs>]"),
+                };
+                n = Some(
+                    v.as_deref()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|k| (1..=50).contains(k))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--n takes a number of runs from 1 to 50")
+                        })?,
+                );
+            }
+            Command::Pick {
+                json: has("--json"),
+                tool: if has("--codex") {
+                    Tool::Codex
+                } else {
+                    Tool::Claude
+                },
+                n,
+            }
+        }
+        "_nudge" => match rest().as_slice() {
+            [id] => Command::Nudge { id: id.clone() },
+            _ => bail!("usage: agp _nudge <account id>"),
         },
         "settings" => Command::Settings,
         "dashboard" => {
@@ -405,10 +469,8 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
             }
             Command::Dashboard { port, open }
         }
-        "skill" => match rest().first().map(String::as_str) {
-            None | Some("show") => Command::Skill { install: false },
-            Some("install") => Command::Skill { install: true },
-            Some(_) => bail!("usage: agp skill [show | install]"),
+        "skill" => Command::Skill {
+            install: parse_skill(&args[1..])?,
         },
         "setup" => Command::Setup,
         "add" => {
@@ -460,6 +522,47 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
         "hook" => Command::Hook(args.get(1).cloned().unwrap_or_default()),
         "bg" => Command::Bg(parse_bg(&args[1..])?),
         _ => Command::Launch(parse_launch(&args)?),
+    })
+}
+
+const SKILL_USAGE: &str = "usage: agp skill [show] | agp skill install [--agent <names>] [--dir <path>] | agp skill list | agp skill uninstall [--agent <names>] [--dir <path>]";
+
+/// `agp skill …` (without the `skill`).
+fn parse_skill(args: &[String]) -> Result<SkillCmd> {
+    let usage = || anyhow::anyhow!(SKILL_USAGE);
+    let Some(sub) = args.first() else {
+        return Ok(SkillCmd::Show);
+    };
+    let rest = &args[1..];
+    let targets = || -> Result<SkillTargets> {
+        let mut t = SkillTargets::default();
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            let (flag, inline) = match a.split_once('=') {
+                Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+                _ => (a.as_str(), None),
+            };
+            let mut value = || {
+                inline
+                    .clone()
+                    .or_else(|| it.next().cloned())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("{flag} needs a value; {SKILL_USAGE}"))
+            };
+            match flag {
+                "--agent" | "--agents" => t.agents.extend(parse_ids(&value()?)),
+                "--dir" => t.dirs.push(value()?),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(t)
+    };
+    Ok(match sub.as_str() {
+        "show" if rest.is_empty() => SkillCmd::Show,
+        "install" => SkillCmd::Install(targets()?),
+        "list" | "status" if rest.is_empty() => SkillCmd::List,
+        "uninstall" | "remove" => SkillCmd::Uninstall(targets()?),
+        _ => return Err(usage()),
     })
 }
 
@@ -603,16 +706,27 @@ mod tests {
             p(&["pick"]),
             Command::Pick {
                 json: false,
-                tool: Tool::Claude
+                tool: Tool::Claude,
+                n: None,
             }
         );
         assert_eq!(
             p(&["pick", "--codex", "--json"]),
             Command::Pick {
                 json: true,
-                tool: Tool::Codex
+                tool: Tool::Codex,
+                n: None,
             }
         );
+        assert_eq!(
+            p(&["pick", "--n", "3", "--json"]),
+            Command::Pick {
+                json: true,
+                tool: Tool::Claude,
+                n: Some(3),
+            }
+        );
+        assert!(parse(&["pick", "--n", "0"].map(OsString::from)).is_err());
         assert_eq!(p(&["--help"]), Command::Help);
         assert_eq!(p(&["-V"]), Command::Version);
         assert_eq!(p(&["hook", "Stop"]), Command::Hook("Stop".into()));
@@ -915,6 +1029,59 @@ mod tests {
         ] {
             assert!(lines.iter().any(|x| x.starts_with(l)), "{l}");
         }
+    }
+
+    #[test]
+    fn skill_subcommands() {
+        let skill = |v: &[&str]| match p(v) {
+            Command::Skill { install } => install,
+            other => panic!("not skill: {other:?}"),
+        };
+        assert_eq!(skill(&["skill"]), SkillCmd::Show);
+        assert_eq!(skill(&["skill", "show"]), SkillCmd::Show);
+        assert_eq!(skill(&["skill", "list"]), SkillCmd::List);
+        assert_eq!(skill(&["skill", "status"]), SkillCmd::List);
+        assert_eq!(
+            skill(&["skill", "install"]),
+            SkillCmd::Install(SkillTargets::default())
+        );
+        assert_eq!(
+            skill(&[
+                "skill",
+                "install",
+                "--agent",
+                "claude,codex",
+                "--agent=amp",
+                "--dir",
+                "/x/skills"
+            ]),
+            SkillCmd::Install(SkillTargets {
+                agents: vec!["claude".into(), "codex".into(), "amp".into()],
+                dirs: vec!["/x/skills".into()],
+            })
+        );
+        assert_eq!(
+            skill(&["skill", "uninstall", "--dir=/y"]),
+            SkillCmd::Uninstall(SkillTargets {
+                agents: vec![],
+                dirs: vec!["/y".into()],
+            })
+        );
+        for bad in [
+            &["skill", "nope"][..],
+            &["skill", "install", "--agent"],
+            &["skill", "install", "--dir="],
+            &["skill", "install", "extra"],
+            &["skill", "list", "--json"],
+        ] {
+            let a: Vec<OsString> = bad.iter().map(OsString::from).collect();
+            assert!(parse(&a).is_err(), "{bad:?}");
+        }
+        // `agp skill -p` is still a claude line.
+        assert_eq!(
+            launch(&["skill", "-p", "x"]).tool_args,
+            ["skill", "-p", "x"]
+        );
     }
 
     #[test]

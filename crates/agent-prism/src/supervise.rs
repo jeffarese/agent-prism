@@ -73,6 +73,20 @@ struct Run<'a> {
     cwd: PathBuf,
     sock: PathBuf,
     hooks: Option<mpsc::Receiver<(String, Value)>>,
+    /// The conversation: the `--session-id` of the first attempt (Claude),
+    /// or the one the line resumes.
+    session_id: Option<String>,
+    /// The account that last ran the resumed conversation.
+    prefer: Option<String>,
+}
+
+/// Removes this run's claim from the run registry when the run ends.
+struct ClaimGuard<'a>(&'a prism_core::paths::Paths);
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        prism_core::registry::remove_record(self.0, std::process::id());
+    }
 }
 
 /// The entry point for print mode with `--on-limit`.
@@ -94,6 +108,18 @@ pub fn run(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         .is_claude()
         .then(|| launch::session_model(&user_args, &config.common_home(&ctx.paths)))
         .flatten();
+    // The first attempt gets a session id when the line names none (the
+    // journal, resume affinity); resumes drop it with the other session
+    // flags.
+    let session_id = (tool == Tool::Claude && !launch::has_session_flag(&user_args))
+        .then(|| uuid::Uuid::new_v4().to_string());
+    let user_args = match &session_id {
+        Some(id) => launch::splice_args(&user_args, vec!["--session-id".into(), id.clone()]),
+        None => user_args,
+    };
+    let cwd = std::env::current_dir().context("current dir")?;
+    let resume = crate::affinity::resume(&ctx.paths, tool, &args.tool_args, &cwd);
+    let session_id = session_id.or_else(|| resume.as_ref().and_then(|r| r.session.clone()));
     let now = unix_now();
     let run_dir = ctx.paths.run_dir(std::process::id());
     let mut run = Run {
@@ -110,15 +136,18 @@ pub fn run(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
             .on_limit
             .unwrap_or(LimitAction::Mode(config.balance.on_limit)),
         wait_left: args.run.max_wait,
-        cwd: std::env::current_dir().context("current dir")?,
+        cwd,
         sock: sock_path(&run_dir),
         hooks: None,
+        session_id,
+        prefer: resume.and_then(|r| r.account),
         config,
     };
     forward_signals();
     if tool.is_claude() {
         run.hooks = listen(&run.sock);
     }
+    let _claim = ClaimGuard(&ctx.paths);
     let code = run.go();
     let _ = std::fs::remove_file(&run.sock);
     let _ = std::fs::remove_dir_all(&run_dir);
@@ -137,11 +166,11 @@ impl Run<'_> {
         let now = unix_now();
         let mut ev = self.journal.event(EventKind::Start, &profile.id, now);
         ev.reason = Some(reason);
+        ev.session = self.session_id.clone();
         ev.cwd = Some(self.cwd.to_string_lossy().into_owned());
         self.journal.write(ev);
-        launch::touch_last_used(&self.ctx.paths, &profile.id, now);
 
-        let mut session: Option<String> = None;
+        let mut session: Option<String> = self.session_id.clone();
         let mut prompt: Option<String> = None;
         let mut recoveries = 0;
         loop {
@@ -204,7 +233,6 @@ impl Run<'_> {
                     ev.session = Some(sid);
                     self.journal.write(ev);
                     prompt = Some(self.resume_prompt(&profile, &reason, Some(&next)));
-                    launch::touch_last_used(&self.ctx.paths, &next.id, unix_now());
                     profile = next;
                 }
             }
@@ -224,15 +252,18 @@ impl Run<'_> {
 
     /// The account to start on and why; `None` when the run gives up.
     fn start_account(&mut self) -> Result<Option<(Profile, String)>> {
+        let prefer = self.prefer.clone();
         loop {
-            let snap = launch::snapshot(
+            let mut snap = launch::snapshot(
                 self.ctx,
                 &self.config,
                 &self.profiles,
                 &self.tokens,
                 self.args.policy,
                 self.model.clone(),
+                prefer.clone(),
             );
+            let lock = snap.lock.take();
             let (candidate, limited, reason) = match &self.args.as_profile {
                 Some(id) => {
                     let p = self
@@ -247,12 +278,7 @@ impl Run<'_> {
                 None => match snap.pick.chosen.as_ref() {
                     Some(id) => (self.find(id), None, snap.pick.reason.clone()),
                     None => {
-                        let p = snap
-                            .pick
-                            .earliest_reset
-                            .as_ref()
-                            .and_then(|(label, _)| self.profiles.iter().find(|p| &p.label == label))
-                            .cloned();
+                        let p = snap.pick.earliest_id.as_ref().and_then(|id| self.find(id));
                         let until = snap.pick.earliest_reset.as_ref().map(|(_, t)| *t);
                         let lim = Limited {
                             kind: LimitKind::FiveHour,
@@ -265,8 +291,11 @@ impl Run<'_> {
             let Some(limited) = limited else {
                 let p = candidate.context("no account to use")?;
                 log::info!("print run on {}: {reason}", p.id);
+                self.claim(&p);
                 return Ok(Some((p, reason)));
             };
+            // Never hold the pick lock through a wait.
+            drop(lock);
             let now = unix_now();
             let who = candidate
                 .as_ref()
@@ -296,6 +325,7 @@ impl Run<'_> {
                         "all usable accounts are limited; using {}{resets}",
                         p.label
                     ));
+                    self.claim(&p);
                     return Ok(Some((p, format!("all limited{resets}"))));
                 }
             }
@@ -306,12 +336,28 @@ impl Run<'_> {
         self.profiles.iter().find(|p| p.id == id).cloned()
     }
 
+    /// Claims `p` for this run in the run registry (DESIGN §6.6); the
+    /// guard in [`run`] removes the claim when the run ends.
+    fn claim(&self, p: &Profile) {
+        let rec = launch::claim_record(
+            &p.id,
+            self.tool(),
+            RunMode::Print,
+            self.session_id.clone(),
+            &self.cwd,
+            true,
+        );
+        launch::write_claim(&self.ctx.paths, &rec);
+        launch::touch_last_used(&self.ctx.paths, &p.id, unix_now());
+    }
+
     /// The limit of account `id` now (usage refreshed first), if any.
     fn limited(&self, id: &str) -> Option<Limited> {
         let p = self.find(id)?;
         let mut fresh = self.config.clone();
         fresh.usage.poll_active_secs = 0;
         launch::refresh_stale(
+            &self.ctx.paths,
             &self.ctx.cache,
             &fresh,
             std::slice::from_ref(&p),
@@ -335,8 +381,11 @@ impl Run<'_> {
             .and_then(|v| v.limited)
     }
 
-    /// The best other account for a move, if one is not limited.
+    /// The best other account for a move, if one is not limited; the
+    /// claim moves there. Picked under the pick lock, so that runs that hit
+    /// the limit together spread.
     fn other_account(&self, current: &Profile) -> Option<Profile> {
+        let _lock = prism_core::registry::PickLock::acquire(&self.ctx.paths, launch::PICK_WAIT);
         let now = unix_now();
         let inputs =
             launch::account_inputs(&self.ctx.paths, &self.profiles, &self.tokens, None, now);
@@ -349,7 +398,9 @@ impl Run<'_> {
             now,
         );
         let pick = balance::pick(&inputs, &usage, &vctx);
-        pick.chosen.and_then(|id| self.find(&id))
+        let next = pick.chosen.and_then(|id| self.find(&id))?;
+        self.claim(&next);
+        Some(next)
     }
 
     /// Whether the attempt stopped on a limit, and which one (`Some(None)`

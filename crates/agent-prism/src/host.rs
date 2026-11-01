@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::SystemTime;
 
 use prism_core::config::{Config, DockShow};
-use prism_core::journal::{EventKind, Recorder};
+use prism_core::journal::{EventKind, Recorder, RunMode};
 use prism_core::model::{
     AccountView, Countdown, DockMode, DockModel, LimitKind, MessageLevel, OnLimit, Policy,
     Projection, StatusMessage, Tool,
@@ -139,6 +139,11 @@ pub struct SessionHost {
     /// The transcript of `session_id` (from `SessionStart`).
     transcript: Option<std::path::PathBuf>,
     busy: bool,
+    /// Started with a prompt and no turn has ended yet: the registry counts
+    /// the session as working before its first hook arrives.
+    starting: bool,
+    /// When this process started, for the registry record.
+    pid_start: Option<i64>,
     last_failure: Option<String>,
     message: Option<(StatusMessage, i64)>,
     pending: Option<Pending>,
@@ -153,6 +158,9 @@ pub struct SessionHost {
     /// Fixed clock for tests.
     test_now: Option<i64>,
 }
+
+/// How long a limit switch waits for another process's pick.
+const HOST_PICK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
@@ -200,6 +208,8 @@ impl SessionHost {
             started_at: now,
             transcript: None,
             busy: false,
+            starting: launch::has_prompt(&init.builder.user_args),
+            pid_start: registry::process_start(std::process::id()),
             last_failure: None,
             message: None,
             pending: None,
@@ -322,18 +332,43 @@ impl SessionHost {
         (self.active.clone(), self.session_id.clone())
     }
 
-    /// Writes this session's registry record.
+    /// The account this session claims: the switch target while a
+    /// countdown or question runs (DESIGN §6.6), else the active account.
+    fn claimed(&self) -> &str {
+        match &self.pending {
+            Some(p) if p.kind != PendingKind::Wait => &p.target,
+            _ => &self.active,
+        }
+    }
+
+    /// Writes this session's registry record (its claim).
     pub fn write_registry(&self) {
         let rec = SessionRecord {
             pid: std::process::id(),
-            profile: self.active.clone(),
+            profile: self.claimed().to_string(),
             session_id: self.session_id.clone(),
             cwd: self.builder.cwd.clone(),
             started_at: self.started_at,
             switched_at: (self.since != self.started_at).then_some(self.since),
+            tool: self.tool,
+            mode: RunMode::Tui,
+            // An idle session weighs less in picks (DESIGN §6.6).
+            busy: self.busy || self.starting,
+            pid_start: self.pid_start,
         };
         if let Err(e) = registry::write_record(&self.ctx.paths, &rec) {
             log::warn!("session registry: {e:#}");
+        }
+    }
+
+    /// Sets `busy` from a hook (any hook ends `starting`); a change goes to
+    /// the registry.
+    fn set_busy(&mut self, busy: bool) {
+        let before = self.busy || self.starting;
+        self.busy = busy;
+        self.starting = false;
+        if before != busy {
+            self.write_registry();
         }
     }
 
@@ -443,6 +478,11 @@ impl SessionHost {
             self.start_wait(format!("hit the {what} limit"), interrupted);
             return;
         }
+        // Under the pick lock with fresh claims, so that sessions that hit
+        // the limit together move to different accounts; the target is
+        // claimed until the switch or a cancel.
+        let _lock = registry::PickLock::acquire(&self.ctx.paths, HOST_PICK_WAIT);
+        self.refresh_inputs();
         let pick = self.pick_other();
         let Some(target) = pick.chosen else {
             let now = self.now();
@@ -486,6 +526,7 @@ impl SessionHost {
             OnLimit::Stay => self.set_message(MessageLevel::Warn, format!("{label} {reason}")),
             OnLimit::Wait => unreachable!("handled above"),
         }
+        self.write_registry();
     }
 
     /// When the active account's limit resets, if known.
@@ -574,6 +615,7 @@ impl SessionHost {
         if self.pending.take().is_some() {
             let label = self.label(&self.active);
             self.set_message(MessageLevel::Info, format!("Staying on {label}"));
+            self.write_registry();
         }
     }
 
@@ -622,8 +664,22 @@ impl SessionHost {
     }
 
     /// Moves the session to `target` (§9 steps 4–5), with `prompt` as the
-    /// first prompt. Returns false when refused (a message says why).
+    /// first prompt. Returns false when refused (a message says why); the
+    /// claim then goes back to the active account.
     fn perform_switch(
+        &mut self,
+        target: &str,
+        prompt: Option<String>,
+        ctl: &mut Control<UiAction>,
+    ) -> bool {
+        let moved = self.switch_to(target, prompt, ctl);
+        if !moved {
+            self.write_registry();
+        }
+        moved
+    }
+
+    fn switch_to(
         &mut self,
         target: &str,
         prompt: Option<String>,
@@ -762,14 +818,14 @@ impl SessionHost {
                     launch::check_memory_key(t, &key);
                 }
             }
-            "UserPromptSubmit" => self.busy = true,
+            "UserPromptSubmit" => self.set_busy(true),
             "Stop" => {
-                self.busy = false;
+                self.set_busy(false);
                 self.check_active_limit();
             }
-            "SessionEnd" => self.busy = false,
+            "SessionEnd" => self.set_busy(false),
             "StopFailure" => {
-                self.busy = false;
+                self.set_busy(false);
                 let err = payload
                     .get("error")
                     .and_then(Value::as_str)

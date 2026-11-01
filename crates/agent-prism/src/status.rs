@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use prism_core::model::{AccountView, TokenState, Tool, UsageStatus, Window};
-use prism_usage::balance::{PickResult, fmt_duration};
+use prism_usage::balance::{self, LoadInfo, PickResult, fmt_duration};
 use prism_usage::views;
 
 use crate::app::AppCtx;
@@ -16,12 +16,19 @@ use crate::tokens::KeychainTokens;
 struct Out {
     tool: Tool,
     views: Vec<AccountView>,
+    /// Runs, expected load and usability per view, in view order.
+    loads: Vec<LoadInfo>,
     pick: PickResult,
+    /// Where the next `n` runs would go (`agp pick --n`).
+    plan: Vec<PickResult>,
+    /// More runs the pool takes now (`None`: `run_load = 0`).
+    capacity: Option<u32>,
     now: i64,
 }
 
-/// The accounts of `tool` and the balancer's pick among them.
-fn gather(ctx: &AppCtx, tool: Tool) -> Result<Out> {
+/// The accounts of `tool` and the balancer's pick among them (a preview:
+/// nothing is claimed). `n`: also plan that many runs.
+fn gather(ctx: &AppCtx, tool: Tool, n: usize) -> Result<Out> {
     let config = ctx.load_config()?;
     let profiles = config.profiles_for(&ctx.paths, tool);
     let tokens = Arc::new(KeychainTokens::new(ctx.store.clone(), profiles.clone()));
@@ -29,23 +36,61 @@ fn gather(ctx: &AppCtx, tool: Tool) -> Result<Out> {
         Tool::Claude => launch::session_model(&[], &config.common_home_for(&ctx.paths, tool)),
         Tool::Codex => None,
     };
-    let snap = launch::snapshot(ctx, &config, &profiles, &tokens, None, model);
+    let snap = launch::preview(ctx, &config, &profiles, &tokens, None, model);
     let proj = launch::projections(&ctx.cache, &snap.usage, snap.ctx.now);
     let views = views::build_views(&snap.inputs, &snap.usage, &proj, &snap.ctx);
+    let loads = balance::load_info(&snap.inputs, &snap.usage, &snap.ctx);
+    let plan = balance::plan(&snap.inputs, &snap.usage, &snap.ctx, n);
+    let capacity = balance::capacity_left(&snap.inputs, &snap.usage, &snap.ctx);
     Ok(Out {
         tool,
         views,
+        loads,
         pick: snap.pick,
+        plan,
+        capacity,
         now: snap.ctx.now,
     })
 }
 
+impl Out {
+    fn load(&self, id: &str) -> Option<&LoadInfo> {
+        self.loads.iter().find(|l| l.profile_id == id)
+    }
+
+    /// The views as JSON, each with `runs`, `load_5h` and `usable`.
+    fn views_json(&self) -> Vec<serde_json::Value> {
+        self.views
+            .iter()
+            .map(|v| {
+                let mut j = serde_json::to_value(v).unwrap_or_default();
+                if let (Some(o), Some(l)) = (j.as_object_mut(), self.load(&v.profile_id)) {
+                    o.insert("runs".into(), l.runs.into());
+                    o.insert(
+                        "load_5h".into(),
+                        l.load_5h.map(|x| (x * 10.0).round() / 10.0).into(),
+                    );
+                    o.insert("usable".into(), l.usable.into());
+                }
+                j
+            })
+            .collect()
+    }
+
+    fn label(&self, id: &str) -> String {
+        self.views
+            .iter()
+            .find(|v| v.profile_id == id)
+            .map_or_else(|| id.to_string(), |v| v.label.clone())
+    }
+}
+
 /// One [`Out`] per tool: Claude always, Codex when it has accounts.
 fn gather_all(ctx: &AppCtx) -> Result<Vec<Out>> {
-    let mut outs = vec![gather(ctx, Tool::Claude)?];
+    let mut outs = vec![gather(ctx, Tool::Claude, 0)?];
     let config = ctx.load_config()?;
     if !config.profiles_for(&ctx.paths, Tool::Codex).is_empty() {
-        outs.push(gather(ctx, Tool::Codex)?);
+        outs.push(gather(ctx, Tool::Codex, 0)?);
     }
     Ok(outs)
 }
@@ -87,14 +132,16 @@ fn window(w: Option<&Window>, now: i64, color: bool) -> (String, String) {
     }
 }
 
-/// The state column.
+/// The state column. `idle`: agp's copy of the access token ran out
+/// because nothing used the account for hours; the account is still logged
+/// in, and the next run (or `token_refresh = "nudge"`) refreshes it.
 pub fn state(v: &AccountView) -> &'static str {
     if v.limited.is_some() {
         "limited"
     } else if matches!(v.token, TokenState::Missing) {
         "no login"
     } else if matches!(v.token, TokenState::Expired { .. }) {
-        "expired"
+        "idle"
     } else {
         match v.usage_status {
             UsageStatus::Fresh => "fresh",
@@ -116,8 +163,18 @@ fn print_table(o: &Out, color: bool) {
             color,
             "1",
             &format!(
-                "  {:<14} {:<28} {:<8} {:<6} {:<8} {:<6} {:<8} {:<12} {:<8} {:<4}",
-                "ACCOUNT", "EMAIL", "PLAN", "5H", "RESET", "7D", "RESET", "SCOPED", "STATE", "POOL"
+                "  {:<14} {:<28} {:<8} {:<6} {:<8} {:<6} {:<8} {:<12} {:<4} {:<8} {:<4}",
+                "ACCOUNT",
+                "EMAIL",
+                "PLAN",
+                "5H",
+                "RESET",
+                "7D",
+                "RESET",
+                "SCOPED",
+                "RUNS",
+                "STATE",
+                "POOL"
             )
         )
     );
@@ -147,8 +204,14 @@ fn print_table(o: &Out, color: bool) {
         };
         let marker = if v.next_pick { "▸" } else { " " };
         let reason = v.reason.clone().unwrap_or_default();
+        let runs = o.load(&v.profile_id).map_or(0, |l| l.runs);
+        let runs = if runs == 0 {
+            "—".to_string()
+        } else {
+            runs.to_string()
+        };
         println!(
-            "{marker} {:<14} {:<28} {:<8} {} {:<8} {} {:<8} {:<12} {} {:<4} {}",
+            "{marker} {:<14} {:<28} {:<8} {} {:<8} {} {:<8} {:<12} {:<4} {} {:<4} {}",
             v.label,
             v.identity.email.clone().unwrap_or_else(|| "—".into()),
             plan,
@@ -157,6 +220,7 @@ fn print_table(o: &Out, color: bool) {
             pad(&p7, 6),
             r7,
             scoped,
+            runs,
             pad(&st_col, 8),
             if v.in_pool { "yes" } else { "no" },
             paint(color, "2", &reason),
@@ -166,6 +230,16 @@ fn print_table(o: &Out, color: bool) {
         Some(id) => println!("\nnext: {id} — {}", o.pick.reason),
         None => println!("\nnext: none — {}", o.pick.reason),
     }
+    if let Some(n) = o.capacity {
+        println!(
+            "room: {n} more run{} before every account nears its 5h limit",
+            plural(n)
+        );
+    }
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn print_all(outs: &[Out], color: bool) {
@@ -207,15 +281,20 @@ pub fn run_status(ctx: Arc<AppCtx>, json: bool, watch: bool) -> Result<i32> {
         if json {
             // `pick` is the Claude pick (the old shape); `picks` has one
             // per tool. Each view names its tool in `identity.tool`.
-            let views: Vec<&AccountView> = outs.iter().flat_map(|o| &o.views).collect();
+            let views: Vec<serde_json::Value> = outs.iter().flat_map(Out::views_json).collect();
             let picks: serde_json::Map<String, serde_json::Value> = outs
                 .iter()
                 .map(|o| (o.tool.bin().to_string(), pick_json(&o.pick)))
+                .collect();
+            let capacity: serde_json::Map<String, serde_json::Value> = outs
+                .iter()
+                .map(|o| (o.tool.bin().to_string(), o.capacity.into()))
                 .collect();
             let v = serde_json::json!({
                 "views": views,
                 "pick": pick_json(&outs[0].pick),
                 "picks": picks,
+                "capacity": capacity,
             });
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
@@ -231,11 +310,37 @@ pub fn run_status(ctx: Arc<AppCtx>, json: bool, watch: bool) -> Result<i32> {
     }
 }
 
-/// `agp pick [--codex] [--json]`.
-pub fn run_pick(ctx: Arc<AppCtx>, json: bool, tool: Tool) -> Result<i32> {
-    let o = gather(&ctx, tool)?;
+/// `agp pick [--codex] [--json] [--n <k>]`: where the next run (or the
+/// next `k` runs, each counting the ones before it) would go. A preview:
+/// nothing is claimed.
+pub fn run_pick(ctx: Arc<AppCtx>, json: bool, tool: Tool, n: Option<usize>) -> Result<i32> {
+    let o = gather(&ctx, tool, n.unwrap_or(0))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&pick_json(&o.pick))?);
+        let mut v = pick_json(&o.pick);
+        if n.is_some()
+            && let Some(m) = v.as_object_mut()
+        {
+            let plan: Vec<serde_json::Value> = o
+                .plan
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "profile": p.chosen,
+                        "label": p.chosen.as_deref().map(|id| o.label(id)),
+                        "reason": p.reason,
+                    })
+                })
+                .collect();
+            m.insert("plan".into(), plan.into());
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if n.is_some() {
+        for p in &o.plan {
+            match &p.chosen {
+                Some(id) => println!("{id}\t{}", p.reason),
+                None => println!("-\t{}", p.reason),
+            }
+        }
     } else {
         match &o.pick.chosen {
             Some(id) => println!("{id}\t{}", o.pick.reason),

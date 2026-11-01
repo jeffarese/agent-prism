@@ -84,6 +84,7 @@ pub fn account_json(
     cached: Option<&CachedUsage>,
     slot: Option<usize>,
     last_used: Option<i64>,
+    load: Option<&balance::LoadInfo>,
 ) -> Value {
     let token = match &v.token {
         TokenState::Valid { expires_at } => {
@@ -139,6 +140,9 @@ pub fn account_json(
         "score": v.score,
         "reason": v.reason,
         "sessions": v.active_elsewhere,
+        "runs": load.map_or(0, |l| l.runs),
+        "load_5h": load.and_then(|l| l.load_5h),
+        "usable": load.is_some_and(|l| l.usable),
         "last_used": last_used,
     })
 }
@@ -179,6 +183,8 @@ pub fn build(
         let ctx = launch::view_ctx(config, None, model.clone(), None, now);
         let views = views::build_views(&inputs, &usage, &proj, &ctx);
         let pick = balance::pick(&inputs, &usage, &ctx);
+        let loads = balance::load_info(&inputs, &usage, &ctx);
+        let capacity = balance::capacity_left(&inputs, &usage, &ctx);
         let label = |id: &str| {
             ps.iter()
                 .find(|p| p.id == id)
@@ -193,6 +199,7 @@ pub fn build(
             "chosen_label": pick.chosen.as_deref().map(label),
             "reason": pick.reason,
             "earliest_reset": pick.earliest_reset.as_ref().map(|(l, t)| json!({"label": l, "at": t})),
+            "capacity": capacity,
         }));
         for v in &views {
             let slot = slots.get(&v.profile_id).copied().flatten();
@@ -201,6 +208,7 @@ pub fn build(
                 usage.get(&v.profile_id),
                 slot,
                 last.get(&v.profile_id).copied(),
+                loads.iter().find(|l| l.profile_id == v.profile_id),
             ));
         }
     }
@@ -221,6 +229,9 @@ pub fn build(
                 "cwd": cwd,
                 "started_at": r.started_at,
                 "switched_at": r.switched_at,
+                "tool": r.tool.bin(),
+                "mode": r.mode,
+                "busy": r.busy,
             })
         })
         .collect();

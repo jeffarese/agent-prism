@@ -84,7 +84,14 @@ pub struct BalanceConfig {
     pub resume_prompt: String,
     pub soft_5h: f64,
     pub hard: f64,
+    /// Percent of a 5h window one run uses per hour on a capacity-1.0 plan:
+    /// what each live run on an account counts for in a pick (DESIGN §6.6).
+    /// 0 turns the load off.
+    pub run_load: f64,
 }
+
+/// The default `balance.run_load`.
+pub const DEFAULT_RUN_LOAD: f64 = 25.0;
 
 impl Default for BalanceConfig {
     fn default() -> Self {
@@ -95,6 +102,7 @@ impl Default for BalanceConfig {
             resume_prompt: "continue".into(),
             soft_5h: 90.0,
             hard: 98.0,
+            run_load: DEFAULT_RUN_LOAD,
         }
     }
 }
@@ -103,9 +111,14 @@ impl Default for BalanceConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TokenRefresh {
+    /// agent-prism never refreshes a token; the next run on the account does.
     #[default]
     Lazy,
     Direct,
+    /// Expired logins of idle Claude accounts are refreshed in the
+    /// background with `claude mcp get <made-up name>`, which refreshes the
+    /// token and makes no model call (DESIGN §6.3).
+    Nudge,
 }
 
 /// `[usage]`.

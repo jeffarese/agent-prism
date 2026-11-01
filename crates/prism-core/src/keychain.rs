@@ -99,6 +99,16 @@ struct OauthJson {
     rate_limit_tier: Option<String>,
 }
 
+/// True for what Claude leaves when the server refuses a token refresh: a
+/// `claudeAiOauth` with no access token and no refresh token. The account
+/// needs `/login`.
+fn logged_out(json: &str) -> bool {
+    let Ok(Blob { oauth: Some(o) }) = serde_json::from_str::<Blob>(json) else {
+        return false;
+    };
+    o.access_token.is_none_or(|t| t.is_empty()) && o.refresh_token.is_none_or(|t| t.is_empty())
+}
+
 /// Parse the credentials JSON. Errors never contain the input.
 pub fn parse_credentials(json: &str) -> Result<Credentials> {
     let blob: Blob = serde_json::from_str(json)
@@ -130,6 +140,9 @@ pub fn read_credentials(store: &dyn SecretStore, profile: &Profile) -> Result<Op
         });
     }
     if let Some(json) = store.read(&profile.keychain_service())? {
+        if logged_out(&json) {
+            return Ok(None);
+        }
         return parse_credentials(&json).map(Some);
     }
     let file = profile.dir.join(".credentials.json");
@@ -213,5 +226,28 @@ pub(crate) mod tests {
                 since: 1_760_500_000
             }
         );
+    }
+
+    #[test]
+    fn refused_refresh_is_no_login() {
+        let p = Profile::bare(
+            "a",
+            Tool::Claude,
+            "/h/.claude-a".into(),
+            "/h/.claude".into(),
+        );
+        let mut store = FakeStore::default();
+        // What Claude writes when the server refuses a refresh.
+        store.0.insert(
+            p.keychain_service(),
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#.into(),
+        );
+        assert!(read_credentials(&store, &p).unwrap().is_none());
+        // An empty access token with a refresh token is only unreadable.
+        store.0.insert(
+            p.keychain_service(),
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"r"}}"#.into(),
+        );
+        assert!(read_credentials(&store, &p).is_err());
     }
 }
