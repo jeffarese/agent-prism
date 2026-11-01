@@ -33,6 +33,15 @@ impl LaunchArgs {
             Tool::Codex => crate::codex::is_direct(&self.tool_args),
         }
     }
+
+    /// A Claude background session: `--bg` among the claude args before
+    /// any `--` (DESIGN §11d).
+    pub fn bg_mode(&self) -> bool {
+        self.tool == Tool::Claude
+            && crate::launch::options(&self.tool_args)
+                .iter()
+                .any(|a| a == "--bg")
+    }
 }
 
 /// What a run does when its account hits a limit (`--on-limit`).
@@ -151,9 +160,33 @@ pub enum Command {
         profile: String,
         cmd: Vec<String>,
     },
+    /// `agp bg …`: background sessions (DESIGN §11d).
+    Bg(BgCommand),
     Hook(String),
     Help,
     Version,
+}
+
+/// `agp bg …` subcommands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BgCommand {
+    /// `agp bg [--json]`: the watched sessions.
+    List { json: bool },
+    /// `agp bg watch <session> [--as <id>] [--policy <p>] [run opts]`.
+    Watch {
+        session: String,
+        as_profile: Option<String>,
+        policy: Option<Policy>,
+        run: RunOptions,
+    },
+    /// `agp bg move <session> [--to <id>] [--json]`.
+    Move {
+        session: String,
+        to: Option<String>,
+        json: bool,
+    },
+    /// `agp bg _watch <session id>`: the detached watcher (internal).
+    Watcher { session_id: String },
 }
 
 /// Help text for `agp --help`.
@@ -176,6 +209,13 @@ Usage:
   agp adopt <id|dir> [--apply] [--no-backup] [--force]
                                       share data between accounts
   agp exec <id> -- <cmd...>         run a command with that profile's env
+  agp [opts] --bg [claude args...]  a Claude Code background session on the
+                                      best account; a watcher handles limits
+  agp bg [--json]                   background sessions and their watchers
+  agp bg watch <session> [--as <id>] [per-run opts]
+                                      watch an existing background session
+  agp bg move <session> [--to <id>] [--json]
+                                      move a background session now
   agp hook <Event>                  internal (Claude hooks)
 
 Launch options:
@@ -192,8 +232,11 @@ Per-run options (this run only; the config does not change):
                        fail    -p / codex exec: exit 75 instead of waiting
                      With -p or codex exec, agent-prism then stays the parent
                      process and resumes the conversation after a limit.
+                     With --bg: switch (also ask), wait, or stay (also fail;
+                     no watcher); default from the config.
   --max-wait <dur>   wait at most this long for a reset (e.g. 90m, 2h, 1d);
-                     longer: -p / codex exec exit 75, a session stays
+                     longer: -p / codex exec exit 75, a session (or --bg)
+                     stays
   --accounts <ids>   use only these accounts (comma-separated)
   --exclude <ids>    never use these accounts
   --max-usage <pct>  treat an account at or over this 5h or weekly % as limited
@@ -202,8 +245,11 @@ Launch options must come first. The first other argument and everything
 after it go to claude (or codex) unchanged. A leading `--` ends agent-prism's
 options. Lines with -p/--print always go to claude (e.g. `agp status -p`);
 codex lines that are not interactive (`agp codex exec ...`) run without
-the dock. For claude's own help run `agp -- --help`, for codex's
-`agp codex --help`.
+the dock. A line with --bg starts a Claude Code background session: agp
+picks the account, runs `claude --bg ...` (stdout, stderr and the exit code
+pass through) and leaves a detached watcher that moves the session to
+another account, or wakes it after the reset, when it hits a limit. For
+claude's own help run `agp -- --help`, for codex's `agp codex --help`.
 ";
 
 fn s(a: &OsString) -> Result<String> {
@@ -313,6 +359,7 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
         "add",
         "doctor",
         "adopt",
+        "bg",
         "codex",
         "help",
         "-h",
@@ -411,7 +458,78 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
             Command::Exec { profile, cmd }
         }
         "hook" => Command::Hook(args.get(1).cloned().unwrap_or_default()),
+        "bg" => Command::Bg(parse_bg(&args[1..])?),
         _ => Command::Launch(parse_launch(&args)?),
+    })
+}
+
+const BG_USAGE: &str = "usage: agp bg [--json] | agp bg watch <session> [--as <id>] [options] | agp bg move <session> [--to <id>] [--json]";
+
+/// `agp bg …` (without the `bg`).
+fn parse_bg(args: &[String]) -> Result<BgCommand> {
+    let usage = || anyhow::anyhow!(BG_USAGE);
+    let Some(sub) = args.first() else {
+        return Ok(BgCommand::List { json: false });
+    };
+    let rest = &args[1..];
+    Ok(match sub.as_str() {
+        "--json" if rest.is_empty() => BgCommand::List { json: true },
+        "list" | "ls" => match rest {
+            [] => BgCommand::List { json: false },
+            [j] if j == "--json" => BgCommand::List { json: true },
+            _ => return Err(usage()),
+        },
+        "watch" => {
+            // The session id may come before or after the options.
+            let first = parse_launch(rest)?;
+            let (session, more) = first.tool_args.split_first().ok_or_else(usage)?;
+            if session.starts_with('-') {
+                bail!("unknown option {session:?} for agp bg watch");
+            }
+            let second = parse_launch(more)?;
+            if let Some(extra) = second.tool_args.first() {
+                bail!("unexpected argument {extra:?} for agp bg watch");
+            }
+            let pick = |a: Option<String>, b: Option<String>| b.or(a);
+            let run = RunOptions {
+                on_limit: second.run.on_limit.or(first.run.on_limit),
+                max_wait: second.run.max_wait.or(first.run.max_wait),
+                accounts: second.run.accounts.or(first.run.accounts),
+                exclude: [first.run.exclude, second.run.exclude].concat(),
+                max_usage: second.run.max_usage.or(first.run.max_usage),
+            };
+            BgCommand::Watch {
+                session: session.clone(),
+                as_profile: pick(first.as_profile, second.as_profile),
+                policy: second.policy.or(first.policy),
+                run,
+            }
+        }
+        "move" => {
+            let (mut session, mut to, mut json) = (None, None, false);
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--json" => json = true,
+                    "--to" => to = Some(it.next().cloned().ok_or_else(usage)?),
+                    _ if a.starts_with("--to=") => to = Some(a["--to=".len()..].to_string()),
+                    _ if session.is_none() && !a.starts_with('-') => session = Some(a.clone()),
+                    _ => return Err(usage()),
+                }
+            }
+            BgCommand::Move {
+                session: session.ok_or_else(usage)?,
+                to,
+                json,
+            }
+        }
+        "_watch" => match rest {
+            [id] => BgCommand::Watcher {
+                session_id: id.clone(),
+            },
+            _ => return Err(usage()),
+        },
+        _ => return Err(usage()),
     })
 }
 
@@ -695,6 +813,108 @@ mod tests {
             ..Default::default()
         };
         assert!(bad.apply(&mut config.clone(), Tool::Claude).is_err());
+    }
+
+    #[test]
+    fn bg_launch() {
+        let l = launch(&[
+            "--as",
+            "x",
+            "--on-limit",
+            "switch",
+            "--",
+            "--bg",
+            "--name",
+            "n",
+            "task",
+        ]);
+        assert!(l.bg_mode() && !l.print_mode());
+        assert_eq!(l.as_profile.as_deref(), Some("x"));
+        assert_eq!(l.run.on_limit, Some(LimitAction::Mode(OnLimit::Auto)));
+        assert_eq!(l.tool_args, ["--bg", "--name", "n", "task"]);
+        // Without `--`: the first claude arg ends agent-prism's flags.
+        let l = launch(&["--max-usage", "80", "--model", "opus", "--bg", "do it"]);
+        assert!(l.bg_mode());
+        assert_eq!(l.run.max_usage, Some(80.0));
+        assert_eq!(l.tool_args, ["--model", "opus", "--bg", "do it"]);
+        // After a claude-side `--` it is a prompt, and Codex has no --bg.
+        assert!(!launch(&["--", "x", "--", "--bg"]).bg_mode());
+        assert!(!launch(&["codex", "--bg"]).bg_mode());
+        assert!(!launch(&["hi"]).bg_mode());
+    }
+
+    #[test]
+    fn bg_subcommands() {
+        let bg = |v: &[&str]| match p(v) {
+            Command::Bg(b) => b,
+            other => panic!("not bg: {other:?}"),
+        };
+        assert_eq!(bg(&["bg"]), BgCommand::List { json: false });
+        assert_eq!(bg(&["bg", "--json"]), BgCommand::List { json: true });
+        assert_eq!(
+            bg(&["bg", "list", "--json"]),
+            BgCommand::List { json: true }
+        );
+        assert_eq!(
+            bg(&["bg", "watch", "f1de9de1", "--as", "pb", "--on-limit=wait"]),
+            BgCommand::Watch {
+                session: "f1de9de1".into(),
+                as_profile: Some("pb".into()),
+                policy: None,
+                run: RunOptions {
+                    on_limit: Some(LimitAction::Mode(OnLimit::Wait)),
+                    ..Default::default()
+                },
+            }
+        );
+        // Options may come first, too.
+        match bg(&["bg", "watch", "--exclude", "a", "s1", "--max-wait", "2h"]) {
+            BgCommand::Watch { session, run, .. } => {
+                assert_eq!(session, "s1");
+                assert_eq!(run.exclude, ["a"]);
+                assert_eq!(run.max_wait, Some(7200));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            bg(&["bg", "move", "s1", "--to", "b", "--json"]),
+            BgCommand::Move {
+                session: "s1".into(),
+                to: Some("b".into()),
+                json: true
+            }
+        );
+        assert_eq!(
+            bg(&["bg", "_watch", "sid"]),
+            BgCommand::Watcher {
+                session_id: "sid".into()
+            }
+        );
+        for bad in [
+            &["bg", "watch"][..],
+            &["bg", "watch", "s", "extra"],
+            &["bg", "watch", "s", "--nope"],
+            &["bg", "move"],
+            &["bg", "nope"],
+        ] {
+            let a: Vec<OsString> = bad.iter().map(OsString::from).collect();
+            assert!(parse(&a).is_err(), "{bad:?}");
+        }
+        // `agp bg -p` is still a claude line.
+        assert_eq!(launch(&["bg", "-p", "x"]).tool_args, ["bg", "-p", "x"]);
+    }
+
+    #[test]
+    fn help_lists_bg() {
+        // chief looks for usage lines that start with `agp bg`.
+        let lines: Vec<&str> = HELP.lines().map(str::trim_start).collect();
+        for l in [
+            "agp bg [--json]",
+            "agp bg watch <session>",
+            "agp bg move <session>",
+        ] {
+            assert!(lines.iter().any(|x| x.starts_with(l)), "{l}");
+        }
     }
 
     #[test]

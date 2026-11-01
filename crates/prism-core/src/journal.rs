@@ -47,6 +47,9 @@ pub enum RunMode {
     /// `agp -p` / `agp codex exec` with `--on-limit`: agent-prism stays the
     /// parent and handles limits.
     Print,
+    /// `agp --bg`: a Claude Code background session; agent-prism's
+    /// watcher writes its limits, waits and moves under the launch's run id.
+    Bg,
 }
 
 /// One journal line. Optional fields are left out when empty.
@@ -167,6 +170,23 @@ impl Recorder {
             mode,
             started_at,
         }
+    }
+
+    /// A recorder that goes on with the run `run` of another process (the
+    /// background watcher writes the events of the `agp --bg` launch).
+    pub fn for_run(paths: Paths, run: String, tool: Tool, mode: RunMode, started_at: i64) -> Self {
+        Self {
+            paths,
+            run,
+            tool,
+            mode,
+            started_at,
+        }
+    }
+
+    /// The run id.
+    pub fn run(&self) -> &str {
+        &self.run
     }
 
     /// An event of `kind` about `profile` at `ts`, for the caller to fill in.

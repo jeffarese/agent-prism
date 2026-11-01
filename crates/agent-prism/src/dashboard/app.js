@@ -114,6 +114,7 @@
     tui: ['Interactive', 'agp sessions with the dock'],
     exec: ['Scripted', 'agp -p and agp codex exec, replaced by the tool'],
     print: ['Supervised print', 'agp -p with --on-limit; agent-prism handles limits'],
+    bg: ['Background', 'agp --bg: a Claude Code background session; a watcher handles limits'],
   };
   const LIMIT = { '5h': '5-hour', '7d': 'weekly', scoped: 'model' };
 
@@ -851,9 +852,9 @@
     cards.push(distCard('Tokens by account', hasTok ? `${compact(tokTotal(t.tokens))} in ${t.runs_with_tokens} run${t.runs_with_tokens === 1 ? '' : 's'}` : null,
       tokItems.length ? bars(tokItems) : el('div', { class: 'acct-note' }, 'No token data for these runs. Tokens come from the Claude transcripts and Codex rollout files of the sessions in the journal.')));
 
-    const modes = ['tui', 'exec', 'print'].map((k, i) => {
+    const modes = ['tui', 'exec', 'print', 'bg'].map((k, i) => {
       const s = a.by_mode.find((x1) => x1.key === k) || { runs: 0, secs: 0 };
-      return { label: MODE[k][0], desc: MODE[k][1], c: NEUTRAL[i], v: s.runs, val: `${s.runs} run${s.runs === 1 ? '' : 's'}${s.secs ? `, ${dur(s.secs)}` : ''}` };
+      return { label: MODE[k][0], desc: MODE[k][1], c: NEUTRAL[i % NEUTRAL.length], v: s.runs, val: `${s.runs} run${s.runs === 1 ? '' : 's'}${s.secs ? `, ${dur(s.secs)}` : ''}` };
     });
     const modeBody = [stackBar(modes, t.runs)];
     if (a.by_tool.length > 1) {
@@ -1037,6 +1038,7 @@
       if (r.live) status = el('span', { class: 'status live' }, 'live');
       else if (r.exit != null) status = el('span', { class: `status ${r.exit === 0 ? 'ok' : 'fail'}` }, `exit ${r.exit}`);
       else if (r.mode === 'exec') status = el('span', { class: 'status', title: 'agp handed the process to the tool; no end is recorded' }, 'handed off');
+      else if (r.mode === 'bg') status = el('span', { class: 'status', title: 'A Claude Code background session; its watcher records limits and moves' }, r.ended ? 'ended' : 'background');
       else status = el('span', { class: 'status', title: 'No end event: the process may have been killed' }, 'no end');
       const len = r.end - r.start;
       const tr = el('tr', {},

@@ -126,6 +126,26 @@ fn union(paths: &Paths, profiles: &[Profile], skip: &Path) -> BTreeSet<String> {
     all
 }
 
+/// Whether `trusted` covers `dir`: the folder itself or a parent of it, but
+/// no parent above `root` (Claude looks only up to the git repo root).
+pub fn covers(trusted: &BTreeSet<String>, dir: &Path, root: Option<&Path>) -> bool {
+    for d in dir.ancestors() {
+        if trusted.contains(d.to_string_lossy().as_ref()) {
+            return true;
+        }
+        if Some(d) == root {
+            break;
+        }
+    }
+    false
+}
+
+/// Whether the Claude account `profile` trusts `dir` (see [`covers`]).
+/// A missing or unreadable `.claude.json` trusts nothing.
+pub fn trusts(paths: &Paths, profile: &Profile, dir: &Path, root: Option<&Path>) -> bool {
+    read(&profile.claude_json_path(paths)).is_some_and(|v| covers(&trusted(&v), dir, root))
+}
+
 /// How many folders `target` trusts, and how many that other accounts in
 /// `profiles` trust it does not (for `doctor`). `None` when its
 /// `.claude.json` is missing or unreadable.
@@ -276,6 +296,31 @@ mod tests {
 
     fn folders(v: &[&str]) -> BTreeSet<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn covers_parents_up_to_the_root() {
+        let t = folders(&["/w", "/r/sub"]);
+        assert!(covers(&t, Path::new("/w"), None));
+        assert!(covers(&t, Path::new("/w/a/b"), None));
+        assert!(covers(&t, Path::new("/r/sub/x"), Some(Path::new("/r"))));
+        // A parent above the repo root does not count.
+        assert!(!covers(
+            &t,
+            Path::new("/w/repo/x"),
+            Some(Path::new("/w/repo"))
+        ));
+        assert!(!covers(&t, Path::new("/other"), None));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, ps) = set(&[("a", false)], dir.path());
+        assert!(!trusts(&paths, &ps[0], Path::new("/w"), None));
+        write(
+            &ps[0],
+            &paths,
+            &serde_json::json!({"projects": {"/w": {TRUST_KEY: true}}}),
+        );
+        assert!(trusts(&paths, &ps[0], Path::new("/w/x"), None));
     }
 
     #[test]

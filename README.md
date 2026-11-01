@@ -75,6 +75,8 @@ agp -p "question"       # print mode: drop-in for claude -p on the best account
 agp codex               # Codex on the best ChatGPT account
 agp codex --as chatgpt  # Codex on one account; codex args follow as usual
 agp codex exec "task"   # drop-in for codex exec on the best ChatGPT account
+agp --bg "task"         # a Claude Code background session; limits handled
+agp bg                  # background sessions agp watches (--json)
 agp status              # usage table of all accounts (--json, --watch)
 agp dashboard           # usage, history and runs in the browser
 agp skill install       # teach Claude and Codex agents to use agp
@@ -168,6 +170,39 @@ it exits with an error (it only retries short API errors), so without
 
 `wait` is also a config value (`balance.on_limit = "wait"`, in
 `agp settings` → Balancing).
+
+## Background sessions (`claude --bg`)
+
+`agp` in front of a `claude --bg` line starts the background session on
+the best account, and leaves a small watcher that handles its limits:
+
+```sh
+agp --bg --name fix-auth "fix the auth bug"
+agp --as work --on-limit wait -- --bg --name nightly "run the migration"
+agp bg                        # the sessions agp watches, their account and state
+agp bg --json                 # the same as JSON (for scripts and orchestrators)
+agp bg watch f1de9de1         # watch a session agp did not start (or after claude respawn)
+agp bg move f1de9de1 --to b   # move a session to another account now
+```
+
+The launch is a drop-in: same args, stdin, stdout, stderr and exit code;
+agp exits as soon as `claude --bg` does. Claude Code leaves a session that
+hits its account's limit blocked until someone acts; the watcher (a
+detached process, one per session) sees the limit in the job's
+`state.json` and then:
+
+- `--on-limit switch` (the default with `on_limit = "auto"`): stops the
+  session and resumes the same conversation on the best other account,
+  with a one-line note and `continue`. With no free account it waits.
+- `--on-limit wait`: waits for the reset, then wakes the session on the
+  same account (at most `--max-wait`).
+- `--on-limit stay` (and `fail`): no watcher.
+
+Moves need shared `projects/` (`agp adopt`) and a trusted folder in the
+target account (agp copies folder trust). agp never deletes a job: after a
+move the old account keeps the stopped job, because the session still uses
+its worktree. `--accounts`, `--exclude`, `--max-usage` and `--policy`
+apply to the first pick and to every move.
 
 ## Agents: the agp skill
 

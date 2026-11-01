@@ -396,6 +396,7 @@ fn mode_key(m: RunMode) -> &'static str {
         RunMode::Tui => "tui",
         RunMode::Exec => "exec",
         RunMode::Print => "print",
+        RunMode::Bg => "bg",
     }
 }
 

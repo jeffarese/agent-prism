@@ -1,6 +1,6 @@
 ---
 name: agp
-description: Use agp (agent-prism) instead of plain `claude -p` or `codex exec` whenever you run Claude Code or Codex from a script, a background job or another agent, and to check the usage and limits of the user's Claude and ChatGPT accounts. agp picks the account with the most quota, can wait for a limit to reset or move to another account mid-run, and resumes the same conversation. Trigger on running `claude -p`, `codex exec`, `codex review`, spawning a headless agent, batch or parallel agent runs, "which account", "usage", "quota", "rate limit", "limit reset".
+description: Use agp (agent-prism) instead of plain `claude -p`, `claude --bg` or `codex exec` whenever you run Claude Code or Codex from a script, a background job or another agent, and to check the usage and limits of the user's Claude and ChatGPT accounts. agp picks the account with the most quota, can wait for a limit to reset or move to another account mid-run, and resumes the same conversation. Trigger on running `claude -p`, `claude --bg`, `codex exec`, `codex review`, spawning a headless agent, batch or parallel agent runs, "which account", "usage", "quota", "rate limit", "limit reset".
 ---
 
 # agp (agent-prism)
@@ -60,6 +60,24 @@ agp --on-limit fail -p "review this PR" > review.md
 agp --max-usage 70 --exclude personal --on-limit switch -p "..."
 agp codex --on-limit wait exec "fix the build"
 ```
+
+## Background sessions
+
+`agp` in front of a `claude --bg` line works the same way, and agp leaves
+a watcher that moves the session to another account (or waits for the
+reset and wakes it) when it hits a limit:
+
+```sh
+agp --bg --name fix-auth "fix the auth bug"     # instead of claude --bg
+agp --on-limit wait --max-wait 6h -- --bg "migrate the tests"
+agp bg --json        # watched sessions: account, state, limit, moves
+agp bg watch <id>    # after `claude respawn <id>`, or for a session agp didn't start
+agp bg move <id> --to <account>   # move one now
+```
+
+Never `claude rm` a session agp moved: the moved session still uses its
+worktree. While `agp bg --json` shows a session as `moving`, don't revive
+it.
 
 ## Check usage before a big batch
 

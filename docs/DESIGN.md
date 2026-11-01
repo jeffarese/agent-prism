@@ -43,6 +43,7 @@ proxy setup) is never offered as an account.
 | Log | `<state>/agent-prism.log` (rotated at 2 MB) | `AGP_LOG=debug` |
 | Adopt journals | `<state>/adopt/<ts>-<profile>.json` | |
 | Run journal | `<state>/runs.jsonl` (cut to its newest half at 8 MB) | |
+| Background sessions | `<state>/bg/<session id>.json` (+ `.lock`, `.act.lock`, `.rec.lock`) | |
 
 All path defaults are computed in one place (`prism_core::paths`). Library
 functions take paths as parameters so that tests use temp dirs. Tests must
@@ -437,6 +438,8 @@ Throttle draws to ≤ 20/s; draw within one frame after output goes quiet
   inside an agent-prism session (nested).
 - Print mode with `--on-limit` (§11a): agent-prism stays the parent
   (`supervise.rs`) instead of exec'ing the tool.
+- `--bg` among the claude args (before any `--`): a Claude Code background
+  session, picked and set up like print mode, plus a watcher (§11d).
 - Exit: when the child exits (not by an agent-prism switch), restore the terminal
   (`CSI r`, show cursor, clear the dock rows, leave raw mode) and exit with
   the child's code.
@@ -612,6 +615,11 @@ agp dashboard [--port <n>] [--no-open]
 agp skill [install]             print or install the agp skill (§11a)
 agp adopt <id|dir> [--apply] [--no-backup] [--force]
 agp exec <id> -- <cmd...>       run a command with that profile's env
+agp [opts] --bg [claude args]   a Claude Code background session (§11d)
+agp bg [--json]                 background sessions and their watchers
+agp bg watch <session> [--as <id>] [--policy <p>] [per-run opts]
+agp bg move <session> [--to <id>] [--json]
+agp bg _watch <session id>      internal (the detached watcher)
 agp hook <Event>                internal
 ```
 
@@ -634,7 +642,14 @@ membership (out-of-pool accounts can be listed), `--exclude` clears `pool`,
 `--max-usage` lowers `balance.hard` and `soft_5h` to the percent, and
 `--on-limit` (all but `fail`) sets `balance.on_limit`. A session applies
 them again after every config reload. Unknown ids are an error. `fail` in
-an interactive session is an error.
+an interactive session is an error. Print mode without `--on-limit` (and
+`--bg`) applies them to its pick too.
+
+With `--bg` (§11d) the effective `--on-limit` is `switch`, `wait` or
+`stay`: `ask` → `switch` (nobody can answer), `fail` → `stay` (no process
+of agent-prism to fail); no flag → the config's `on_limit` (`auto`, `ask`
+→ `switch`). `--max-wait` caps a wait for a reset; past it the session
+stays limited.
 
 Print mode with `--on-limit` (`agp -p`, `agp codex exec`, any direct codex
 line): agent-prism spawns the tool as a child instead of exec. Claude gets
@@ -668,7 +683,9 @@ per-user temp path when `<run>/ctl.sock` is longer than 103 bytes).
 run, for `agp dashboard`: `ts`, `run` (`<pid>-<start ts>`), `ev`
 (`start | limit | wait | switch | resume | end`), `tool`, `mode` (`tui` =
 session, `exec` = print mode that replaced itself, so no `end`, `print` =
-supervised print mode), `profile`, and when they apply `from`, `limit`
+supervised print mode, `bg` = a background session: the launch writes
+`start`, the watcher writes the rest under the same run id, `end` when the
+job is gone), `profile`, and when they apply `from`, `limit`
 (`5h | 7d | scoped`), `until`, `reason`, `session`, `cwd`, `exit`, `secs`.
 A line is one `write` in append mode, so processes don't interleave. Errors
 are logged and never fail a run.
@@ -737,6 +754,183 @@ else the first free slot in config order; past 8 accounts, gray. Every
 chart has a tooltip on hover and keyboard focus; the history and timeline
 charts have a table view; the legend hides an account (⌥-click: only
 that one).
+
+## 11d. Background sessions (`claude --bg`)
+
+Code: `crates/agent-prism/src/bg/` (`job.rs` Claude's job files and output,
+`record.rs` the record and locks, `claude.rs` running claude and the
+detached spawn, `mover.rs` stop and resume, `watch.rs` the watcher,
+`mod.rs` the commands).
+
+`claude --bg …` hands the session to Claude Code's per-account supervisor
+and exits within a second, so agent-prism is not the parent of the session
+and the dock (§9) and supervised print mode (§11a) can't see its limits. A
+detached watcher process does. Facts (Claude Code 2.1.316):
+
+- Each profile (config dir) has its own supervisor and
+  `<config dir>/jobs/<short>/state.json` per session (`short` = first 8
+  hex of the session id): `state` (`working | blocked | done | …`),
+  `detail`, `needs`, `sessionId`, `cwd` (where it was launched),
+  `worktreePath`, `respawnFlags` (the launch flags), `updatedAt`,
+  `createdAt`. `claude agents --json --all` in the profile's env lists the
+  sessions with `id`, `sessionId`, `pid` (absent when the process is gone).
+- A rate limit sets `state: blocked`, `needs: "rate limited — wait and
+  retry · <detail>"`, `detail: "You've hit your 5-hour limit · resets
+  6:10am (Europe/Madrid)"`. The process stays alive, idle; it does not
+  retry.
+- The launch prints `backgrounded · <short> · <name>` (with escape
+  sequences); a wake prints `woke session <short> with its saved options`.
+- `claude --bg --resume <id> <flags…> "<prompt>"` in a profile with no job
+  for the session resumes the same session (same id) with its whole
+  conversation, back in its worktree. It needs the transcript visible
+  (shared `projects/`) and the folder trusted. In a profile that already
+  has the job, any flag (and a resume while the old process runs) starts a
+  copy under a new id that shares the worktree; there the no-flag form
+  `claude --bg --resume <id> "<prompt>"` wakes the stopped job under the
+  same id. `claude rm` deletes the job and its worktree: agent-prism never
+  runs it (the moved session still uses the worktree).
+
+**Launch** (`agp [opts] [--] --bg <claude args…>`, Claude only). The pick,
+env and `--settings` (overlay, memory dir) are print mode's (§7.4), with
+the per-run options; trust is synced (§4.7). Never the wrapper, and the
+nested-session check does not apply (`AGP=1` changes nothing). claude runs
+with stdin and stderr inherited and stdout copied through as it comes (to
+read the short id); agent-prism waits for claude to exit, reads the pipe
+for at most 1 s more (a supervisor claude started may hold it) and exits
+with claude's code. A non-zero exit: nothing else. Else: the short id from
+the output (else the newest job of the profile created for this cwd since
+the launch), the session id from its `state.json` (waiting up to 5 s, else
+`claude agents`), a journal `start`, and, unless the effective on-limit is
+`stay`, the watcher. A problem there is one stderr note; the exit code
+stays claude's.
+
+**The watcher** (`agp bg _watch <session id>`). Spawned with `setsid` (a
+new session and process group, so a timeout that kills the launch's group
+leaves it alone), stdin/stdout/stderr on `/dev/null` and every other
+inherited descriptor closed at exec; nobody waits for it. It logs to the
+agent-prism log. One per session: it holds `<id>.lock` (`flock`) for its
+life; a second one gives up after 2 s. Every round (10 s; 60 s after 10
+minutes without a change; `AGP_BG_POLL_MS` for tests) it reads the record
+and the config (with the watch's options), stats the job's `state.json`
+in the record's profile and parses it only when its mtime changed. It
+does not run `claude agents` in the loop (only to act, and once per
+change of an old account's job, below).
+
+- The job folder gone in the current profile: state `ended`, journal
+  `end`, exit. No change for 7 days (counted from the watch's start at the
+  earliest): `dormant`, exit (`agp bg watch` re-arms it).
+- A job of the session in a previous profile changed more than 2 s after
+  the current one's and `claude agents` there shows it with a live pid
+  (someone ran `claude respawn` in the old account; checked once per such
+  change): the record follows it there. A move writes the old job (the
+  stop) before the new one, so a move never looks like this.
+- A new limit (rate limited, `updatedAt` not handled yet; each is handled
+  once): refresh that profile's usage (if older than 30 s); the window
+  and reset come from the usage when it shows the account limited, else
+  from the text (`resets 6:10am (Europe/Madrid)`, `resets Nov 3, 6pm
+  (UTC)`); record `limit`, journal `limit`. Then per on-limit: `stay`
+  → state `limited`; `switch` → move now (below) to the best target; no
+  target or every attempt failed → wait as `wait` does, and every 5 min
+  look again for a free account; `wait` → state `waiting` until the reset
+  + 30 s (unknown: check again in 5 min), journal `wait`; past
+  `--max-wait` (from the limit's time) → `limited`.
+- The wait is over: if the refreshed usage shows a later reset, wait
+  again; else wake the session on the same account (below, no targets).
+  A failed wake retries in 5 min.
+- The job no longer rate limited while `limited` or `waiting` (it went on
+  by itself, e.g. someone woke it): back to `watching`; a newer
+  `updatedAt` that is still a limit is a new limit.
+- A record left `moving` with the action lock free (a move died): back to
+  `watching` and the limit is looked at again.
+- `agp bg watch` with another on-limit than recorded: the current limit is
+  planned again.
+
+**Targets.** The balancer's picks (§6.6) over the pool with the watch's
+`--accounts`/`--exclude`/`--max-usage`/`--policy`, without the current
+profile, repeated to a list best first; only profiles whose `projects`
+resolves to the same dir as the current one's and that trust the job's
+`cwd` (after a trust sync, §4.7; a trusted parent counts up to the git
+toplevel). `agp bg move --to` takes that one account (limited or out of
+the pool too) after the same two checks.
+
+**Moving a session** (`mover::relocate`; the watcher and `agp bg move`):
+
+1. Record state `moving` (atomic write) before anything stops.
+2. `claude stop <short>` in the current profile; wait (≤ 20 s) until
+   `claude agents` there shows no live pid (between the checks agent-prism
+   watches the known pid itself). Still running: give up (a resume would
+   start a copy).
+3. For each target in order (a wake: the current profile): check once
+   more that `claude agents` shows no live pid in the current profile, in
+   every profile tried so far and in the target. One has: abort, the
+   record goes back to `watching` on the profile where it runs (a move if
+   that is another profile), logged; the limit is not handled again.
+4. Resume in the target's env with cwd = the job's `cwd`: the flags form
+   with the old job's `respawnFlags` when the target has no
+   `jobs/<short>` (a session agent-prism launched gets its `--settings`
+   built again for the target from the user's original value), else the
+   no-flag form. The prompt: a one-line note ("This session moved from
+   account A to B after the 5-hour limit" / "on request" for
+   `agp bg move` / "agent-prism waited for the reset on the same account
+   (A) after the 5-hour limit"; "the old process's background tasks and
+   subagents stopped, so start again the ones you still need"), a blank
+   line, then `balance.resume_prompt` (`continue` when empty).
+5. The output must name the same short id; another id is a copy: stop it,
+   and the attempt failed. Then `claude agents` in the target must show
+   the session with a live pid within 15 s. Only then the record leaves
+   `moving`: `watching` on the target with the move in `moves`, journal
+   `switch` (a wake: journal `resume`). A failed attempt tries the next
+   target.
+6. Every attempt failed: the watcher waits (state `waiting`); `agp bg
+   move` wakes the session where it was (same steps, no targets) and exits
+   non-zero.
+
+The whole stop-and-resume runs under `<id>.act.lock`, which the watcher
+takes when it acts (and skips a round while someone else holds it) and
+`agp bg move` holds for its whole run, so they never race.
+
+**Record** `<state>/bg/<session id>.json`, written atomically under
+`<id>.rec.lock` (read-modify-write). `agp bg --json` prints
+`{"sessions": [<record>…]}`, newest change first; another program
+(chief) reads it, so these keys are a contract:
+
+```json
+{"session_id": "…", "short_id": "f1de9de1", "name": "…", "profile": "laura", "label": "PB4",
+ "config_dir": "/Users/x/.claude-laura", "cwd": "/…", "on_limit": "switch",
+ "state": "watching|limited|waiting|moving|ended|dormant",
+ "limit": {"text": "You've hit your 5-hour limit · resets 6:10am (Europe/Madrid)",
+           "since": 1793500000, "resets_at": 1793510000, "window": "5-hour limit"},
+ "moves": [{"at": 1793500100, "from": "cpb", "from_label": "PB2", "from_config_dir": "/…/.claude-cpb",
+            "to": "laura", "to_label": "PB4", "to_config_dir": "/…/.claude-laura", "reason": "5-hour limit"}],
+ "previous": [{"profile": "cpb", "label": "PB2", "config_dir": "/…/.claude-cpb"}],
+ "watcher_pid": 1234, "watching": true, "updated_at": 1793500100}
+```
+
+`config_dir` is null for the default install; `limit` is null when not
+limited; `resets_at` null when unknown; times are unix seconds.
+`moves[].reason`: `5-hour limit`, `weekly limit`, `model limit`, `limit`
+(window unknown) or `manual move`. `previous`: every profile the session
+ran in before the current one, oldest first, without repeats and without
+the current profile (where the stopped old jobs are). `watching`: a
+watcher holds the lock now. Extra keys: `created_at`, `wait_until`,
+`note` (the last thing that happened), `options` (the watch's per-run
+options), `run` (journal run id), `launch`, `limit_key`. Records of
+sessions that ended a week ago are removed when listed.
+
+**`agp bg watch <session id | short id> [--as <id>] [--policy <p>] [per-run
+opts]`**: the profile is `--as`, else the one whose `jobs/` has the short
+id (the newest `state.json` when several do: the old accounts keep their
+stopped jobs). It writes the record with the given options (replacing the
+old ones; the on-limit from the config when none is given) and starts the
+detached watcher unless one runs (which reads the new options in its next
+round). A session agent-prism did not launch gets a journal run of its
+own. Exits 0 at once; the orchestrator calls it after `claude respawn`.
+
+**`agp bg move <session> [--to <id>] [--json]`**: moves now, without a
+limit, in the foreground within about 60 s (the watch's options apply to
+the target choice). `--json` prints `{"moved": true, "session_id",
+"short_id", "from", "from_label", "to", "to_label", "to_config_dir"}`;
+a failure exits 1 with the reason on stderr.
 
 ## 12. Codex (ChatGPT plans)
 

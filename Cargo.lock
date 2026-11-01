@@ -16,6 +16,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "crossterm",
+ "fs4",
  "jiff",
  "libc",
  "log",

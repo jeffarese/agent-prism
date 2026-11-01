@@ -93,6 +93,12 @@ impl Drop for RunGuard {
 /// The launch entry point.
 pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
     let tool = args.tool;
+    // Before print mode and the nested-session check: a background launch
+    // never runs in the wrapper, and an `AGP=1` env must not stop its
+    // watcher.
+    if args.bg_mode() {
+        return crate::bg::launch(&ctx, &args);
+    }
     if args.print_mode() {
         if args.run.on_limit.is_some() {
             return crate::supervise::run(&ctx, &args);
@@ -247,8 +253,51 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
 /// blocks; when agent-prism can't pick it still runs the tool.
 pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
     let tool = args.tool;
+    match prepare_print(ctx, args)? {
+        Prepared::Exit(code) => Ok(code),
+        Prepared::Plain(cmd) => exec_print(cmd, tool),
+        Prepared::Account(a) => {
+            let now = unix_now();
+            let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Exec, now);
+            let mut ev = journal.event(EventKind::Start, &a.profile.id, now);
+            ev.cwd = Some(a.cwd.to_string_lossy().into_owned());
+            journal.write(ev);
+            exec_print(a.cmd, tool)
+        }
+    }
+}
+
+/// A print-mode (or `--bg`) line, ready to run.
+pub(crate) enum Prepared {
+    /// Give up with this code (the tool was not found).
+    Exit(i32),
+    /// No account selection: the plain tool with the user's args.
+    Plain(Command),
+    /// The tool on an account.
+    Account(Box<PrintAccount>),
+}
+
+/// The account a print-mode line runs on, and its command.
+pub(crate) struct PrintAccount {
+    pub cmd: Command,
+    /// The config with the run options applied.
+    pub config: Config,
+    pub profile: Profile,
+    /// Why this account (the balancer's reason, "pinned with --as", ...).
+    pub reason: String,
+    /// The user's `--settings` value (Claude), before agent-prism merged it.
+    pub user_settings: Option<String>,
+    pub cwd: PathBuf,
+}
+
+/// Picks the account for a print-mode line and builds its command: the
+/// account env, and for Claude the merged `--settings` (overlay, memory
+/// dir). The per-run options (`--accounts`, `--exclude`, `--max-usage`)
+/// narrow the pick.
+pub(crate) fn prepare_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<Prepared> {
+    let tool = args.tool;
     let loaded = Config::load(&ctx.paths);
-    let (config, reason) = match loaded {
+    let (mut config, reason) = match loaded {
         Ok(Some(c)) if c.profiles.iter().any(|p| p.tool == tool) => (c, None),
         Ok(Some(c)) => (c, Some("no accounts configured".to_string())),
         Ok(None) => (Config::default(), Some("no config".to_string())),
@@ -267,7 +316,7 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         Ok(p) => p,
         Err(e) => {
             eprintln!("agp: {e:#}");
-            return Ok(127);
+            return Ok(Prepared::Exit(127));
         }
     };
     let plain = |why: &str| {
@@ -278,11 +327,12 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         log::warn!("print mode without account: {why}");
         let mut cmd = Command::new(&program);
         cmd.args(&args.tool_args);
-        exec_print(cmd, tool)
+        Ok(Prepared::Plain(cmd))
     };
     if let Some(why) = reason {
         return plain(&why);
     }
+    args.run.apply(&mut config, tool)?;
     let profiles = config.profiles_for(&ctx.paths, tool);
     if profiles.is_empty() {
         return plain("no accounts configured");
@@ -292,12 +342,13 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         Tool::Claude => launch::take_user_settings(&args.tool_args),
         Tool::Codex => (args.tool_args.clone(), None),
     };
-    let profile = if let Some(id) = &args.as_profile {
-        profiles
+    let (profile, reason) = if let Some(id) = &args.as_profile {
+        let p = profiles
             .iter()
             .find(|p| &p.id == id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"))?
+            .ok_or_else(|| anyhow::anyhow!("no profile {id:?} in the config"))?;
+        (p, "pinned with --as".to_string())
     } else {
         let model = tool
             .is_claude()
@@ -312,7 +363,7 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         {
             Some(p) => {
                 log::info!("pick {}: {}", p.id, snap.pick.reason);
-                p.clone()
+                (p.clone(), snap.pick.reason.clone())
             }
             None => {
                 let reset = snap
@@ -330,7 +381,7 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
                             "agp: all pool accounts are limited; using {} (resets in {d})",
                             p.label
                         );
-                        (p, format!("resets in {d}"))
+                        (p, format!("all limited, resets in {d}"))
                     }
                     None => {
                         let p = profiles
@@ -344,44 +395,38 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
                     }
                 };
                 log::warn!("print mode fallback to {}: {note}", p.id);
-                p
+                (p, note)
             }
         }
     };
     log::info!("print mode on {}", profile.id);
-    let now = unix_now();
-    launch::touch_last_used(&ctx.paths, &profile.id, now);
-    let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Exec, now);
-    let mut ev = journal.event(EventKind::Start, &profile.id, now);
-    ev.cwd = std::env::current_dir()
-        .ok()
-        .map(|d| d.to_string_lossy().into_owned());
-    journal.write(ev);
+    launch::touch_last_used(&ctx.paths, &profile.id, unix_now());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut cmd = Command::new(&program);
     if tool == Tool::Codex {
         let (_, config_args) = config.tool_bin_args(tool);
-        let mut cmd = Command::new(&program);
         cmd.args(config_args).args(&profile.args).args(&user_args);
-        let (set, remove) = launch::child_env(&profile, std::path::Path::new(""));
-        for k in remove {
-            cmd.env_remove(k);
-        }
-        cmd.envs(set);
-        return exec_print(cmd, tool);
+    } else {
+        let overlay = ctx.paths.profile_overlay(&profile.id);
+        let overlay = overlay.is_file().then_some(overlay);
+        let settings = print_settings(user_settings.clone(), overlay.as_deref(), |u, o| {
+            launch::memory_dir(&profile, &cwd, &[u, o], |k| std::env::var(k).ok())
+        });
+        cmd.args(print_args(&config, &profile, &user_args, settings));
     }
-    let overlay = ctx.paths.profile_overlay(&profile.id);
-    let overlay = overlay.is_file().then_some(overlay);
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let settings = print_settings(user_settings, overlay.as_deref(), |u, o| {
-        launch::memory_dir(&profile, &cwd, &[u, o], |k| std::env::var(k).ok())
-    });
-    let mut cmd = Command::new(&program);
-    cmd.args(print_args(&config, &profile, &user_args, settings));
     let (set, remove) = launch::child_env(&profile, std::path::Path::new(""));
     for k in remove {
         cmd.env_remove(k);
     }
     cmd.envs(set);
-    exec_print(cmd, tool)
+    Ok(Prepared::Account(Box::new(PrintAccount {
+        cmd,
+        config,
+        profile,
+        reason,
+        user_settings,
+        cwd,
+    })))
 }
 
 /// The `--settings` value for print mode: the overlay path, the user value,

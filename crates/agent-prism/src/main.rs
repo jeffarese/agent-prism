@@ -7,10 +7,13 @@
 //!   from this file instead of `/usr/bin/security`.
 //! - `AGP_NO_POLL=1`: no usage poller and no launch-time refresh; the
 //!   cache files are used as they are.
+//! - `AGP_BG_POLL_MS=<n>`: the background watcher polls every n ms
+//!   instead of 10 s.
 
 mod actions;
 mod adopt_cmd;
 mod app;
+mod bg;
 mod cli;
 mod codex;
 mod dashboard;
@@ -94,6 +97,7 @@ fn run(args: Vec<OsString>) -> Result<i32> {
             },
         ),
         Command::Exec { profile, cmd } => run_exec(&ctx, &profile, &cmd),
+        Command::Bg(b) => bg::run(&ctx, b),
         Command::Hook(_) | Command::Help | Command::Version => Ok(0),
     }
 }

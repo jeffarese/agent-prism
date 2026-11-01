@@ -26,6 +26,7 @@ crossbeam-channel.workspace = true
 signal-hook.workspace = true
 libc.workspace = true
 log.workspace = true
+fs4.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
