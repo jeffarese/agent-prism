@@ -443,17 +443,26 @@ fn local_hhmm(t: i64) -> String {
 /// The countdown text, e.g. `Acme Al hit the 5h limit · moving to Acme Bea
 /// in 4s · ⌃\ stay`. Keys go to Claude while no panel is open, so the menu
 /// key is the only way to stay.
-fn countdown_text(model: &DockModel) -> Option<String> {
+/// Falls back to the compact form, `→ Acme Bea in 4s · ⌃\ stay`, when the
+/// full text is wider than `width`.
+fn countdown_text(model: &DockModel, width: usize) -> Option<String> {
     let c = model.countdown.as_ref()?;
     let secs = (c.deadline - model.now).max(0);
-    Some(format!(
+    let full = format!(
         "{} {} · moving to {} in {}s · {} stay",
         c.from_label, c.reason, c.to_label, secs, model.menu_key_label
+    );
+    if full.width() < width {
+        return Some(full);
+    }
+    Some(format!(
+        "→ {} in {secs}s · {} stay",
+        c.to_label, model.menu_key_label
     ))
 }
 
-fn status_line(model: &DockModel) -> Line<'static> {
-    if let Some(t) = countdown_text(model) {
+fn status_line(model: &DockModel, width: usize) -> Line<'static> {
+    if let Some(t) = countdown_text(model, width) {
         return Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -472,15 +481,23 @@ fn status_line(model: &DockModel) -> Line<'static> {
         };
         return Line::from(vec![Span::raw(" "), Span::styled(m.text.clone(), st)]);
     }
+    // Later parts are dropped first when the terminal is narrow.
     let mut s = format!(" {}{} menu", glyphs(model).menu, model.menu_key_label);
+    let mut parts = vec![];
     if let Some(id) = &model.session_short {
-        let _ = write!(s, " · session {id}");
+        parts.push(format!(" · session {id}"));
     }
     if let Some((label, since)) = &model.on_account {
-        let _ = write!(s, " · on {label} since {}", local_hhmm(*since));
+        parts.push(format!(" · on {label} since {}", local_hhmm(*since)));
     }
     if let Some(age) = model.usage_age_secs {
-        let _ = write!(s, " · usage {} ago", fmt_duration(age));
+        parts.push(format!(" · usage {} ago", fmt_duration(age)));
+    }
+    for p in parts {
+        if s.width() + p.width() > width {
+            break;
+        }
+        s.push_str(&p);
     }
     Line::from(Span::styled(s, dim()))
 }
@@ -581,7 +598,7 @@ fn render_full(model: &DockModel, area: Rect, buf: &mut Buffer) {
         buf.set_line(
             area.x,
             area.y + area.height - 1,
-            &status_line(model),
+            &status_line(model, w),
             area.width,
         );
     }
@@ -603,7 +620,16 @@ fn compact_pct(w: Option<&Window>) -> Span<'static> {
     Span::styled(t, st)
 }
 
-fn render_compact(model: &DockModel, area: Rect, buf: &mut Buffer) {
+/// What the compact line shows; pieces are dropped in order on narrow
+/// terminals.
+#[derive(Clone, Copy)]
+struct CompactCols {
+    window_name: bool,
+    pool: bool,
+    labels: bool,
+}
+
+fn compact_line(model: &DockModel, cols: CompactCols) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![];
     for (i, a) in model.accounts.iter().enumerate() {
         if i > 0 {
@@ -613,29 +639,32 @@ fn render_compact(model: &DockModel, area: Rect, buf: &mut Buffer) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(g, gs));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!(" {} ", a.label), label_style(a, i)));
-        let u = a.usage.as_ref();
-        for (name, w) in [
-            ("5h", u.and_then(|u| u.five_hour.as_ref())),
-            ("7d", u.and_then(|u| u.seven_day.as_ref())),
-        ] {
-            spans.push(Span::styled(format!(" {name} "), dim()));
-            spans.push(compact_pct(w));
+        if cols.labels {
+            spans.push(Span::styled(format!(" {} ", a.label), label_style(a, i)));
         }
+        if cols.window_name {
+            spans.push(Span::styled(" 5h ", dim()));
+        } else if cols.labels {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(compact_pct(
+            a.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
+        ));
         if a.next_pick {
             spans.push(Span::raw(format!(" {}", glyphs(model).next)));
         }
     }
-    if has_pool_row(model) {
+    if cols.pool && has_pool_row(model) {
         spans.push(Span::styled(" │ ", dim()));
         spans.push(Span::styled(
             glyphs(model).pool,
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        for (name, (w, _)) in [("5h", pool_five(model)), ("7d", pool_seven(model))] {
-            spans.push(Span::styled(format!(" {name} "), dim()));
-            spans.push(compact_pct(w.as_ref()));
-        }
+        spans.push(Span::styled(
+            if cols.window_name { " 5h " } else { " " },
+            dim(),
+        ));
+        spans.push(compact_pct(pool_five(model).0.as_ref()));
     }
     spans.push(Span::styled(" │ ", dim()));
     if let Some(c) = &model.countdown {
@@ -656,7 +685,41 @@ fn render_compact(model: &DockModel, area: Rect, buf: &mut Buffer) {
         format!("{}{} ", glyphs(model).menu, model.menu_key_label),
         dim(),
     ));
-    buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+    Line::from(spans)
+}
+
+fn render_compact(model: &DockModel, area: Rect, buf: &mut Buffer) {
+    let all = CompactCols {
+        window_name: true,
+        pool: true,
+        labels: true,
+    };
+    let candidates = [
+        all,
+        CompactCols {
+            window_name: false,
+            ..all
+        },
+        CompactCols {
+            window_name: false,
+            pool: false,
+            labels: true,
+        },
+        CompactCols {
+            window_name: false,
+            pool: false,
+            labels: false,
+        },
+    ];
+    let w = area.width as usize;
+    let mut line = Line::default();
+    for (k, c) in candidates.iter().enumerate() {
+        line = compact_line(model, *c);
+        if k == candidates.len() - 1 || line_width(&line) <= w {
+            break;
+        }
+    }
+    buf.set_line(area.x, area.y, &line, area.width);
 }
 
 /// Draw the dock for `model` into `area`. Full mode when the area has more
@@ -945,16 +1008,47 @@ mod tests {
 
     #[test]
     fn compact_widths() {
-        for w in [120, 80, 50] {
-            let r = draw(&model(DockMode::Compact), w, 1);
-            assert!(r[0].contains("●  Acme Al  5h 48% 7d 31%"), "{}", r[0]);
-        }
         let r = draw(&model(DockMode::Compact), 120, 1);
         assert!(
-            r[0].contains("○  Acme Bea  5h 1% 7d 72% ▸ │ Σ 5h 24% 7d 52% │ ⌃\\"),
+            r[0].contains("●  Acme Al  5h 48% │ ○  Acme Bea  5h 1% ▸ │ Σ 5h 24% │ ⌃\\"),
             "{}",
             r[0]
         );
+        assert!(!r[0].contains("7d"), "{}", r[0]);
+        // Narrow terminals drop the window name, then the pool, then labels,
+        // keeping the menu key visible.
+        let r = draw(&model(DockMode::Compact), 50, 1);
+        assert!(
+            r[0].contains("●  Acme Al  48% │ ○  Acme Bea  1% ▸ │ Σ 24% │ ⌃\\"),
+            "{}",
+            r[0]
+        );
+        let r = draw(&model(DockMode::Compact), 44, 1);
+        assert!(
+            r[0].contains("●  Acme Al  48% │ ○  Acme Bea  1% ▸ │ ⌃\\"),
+            "{}",
+            r[0]
+        );
+        let r = draw(&model(DockMode::Compact), 30, 1);
+        assert!(r[0].contains("● 48% │ ○ 1% ▸ │ ⌃\\"), "{}", r[0]);
+    }
+
+    #[test]
+    fn status_line_narrow() {
+        let r = draw(&model(DockMode::Full), 40, 5);
+        assert!(r[4].contains("⌃\\ menu · session 3f2a91c0"), "{}", r[4]);
+        assert!(!r[4].contains("usage"), "{}", r[4]);
+        let r = draw(&model(DockMode::Full), 20, 5);
+        assert_eq!(r[4].trim_end(), " ⌃\\ menu");
+        let mut m = model(DockMode::Full);
+        m.countdown = Some(Countdown {
+            from_label: "Acme Al".into(),
+            to_label: "Acme Bea".into(),
+            reason: "hit the 5h limit".into(),
+            deadline: 1004,
+        });
+        let r = draw(&m, 40, 5);
+        assert!(r[4].contains("→ Acme Bea in 4s · ⌃\\ stay"), "{}", r[4]);
     }
 
     #[test]
@@ -993,8 +1087,14 @@ mod tests {
             r[2]
         );
         assert!(r[4].contains("Acme Al hit the 5h limit · moving to Acme Bea in 4s · ⌃\\ stay"));
+        let r = draw(&m, 80, 1);
+        assert!(r[0].contains("✕  Acme Al"), "{}", r[0]);
         let r = draw(&m, 50, 1);
-        assert!(r[0].contains("✕  Acme Al"));
+        assert!(
+            r[0].contains("✕ 48%") && r[0].contains("→ Acme Bea in 4s"),
+            "{}",
+            r[0]
+        );
     }
 
     #[test]

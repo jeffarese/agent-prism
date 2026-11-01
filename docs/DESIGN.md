@@ -498,7 +498,11 @@ paste goes to the focused text field.
   `Acme Al hit the 5h limit · moving to Acme Bea in 4s · ⏎ now · esc stay`.
 - Narrow terminals drop columns in this order: projection, scoped, reset
   times, tier, bars (keep percentages).
-- Compact: ` ● Acme Al 5h 48% 7d 31% │ ○ Acme Bea 5h 1% 7d 72% ▸ │ ⌃\ `.
+  The status row drops its trailing parts (usage age, account, session) to
+  fit, and the countdown shortens to `→ Acme Bea in 4s · ⌃\ stay`.
+- Compact shows the 5h window only:
+  ` ● Acme Al 5h 48% │ ○ Acme Bea 5h 1% ▸ │ Σ 5h 24% │ ⌃\ `. Narrow terminals
+  drop the `5h` names, then the pool, then the labels (` ● 48% │ ○ 1% ▸ │ ⌃\ `).
 - Colors follow the terminal palette (ANSI 16 + bold/dim), so light and dark
   themes both work.
 
