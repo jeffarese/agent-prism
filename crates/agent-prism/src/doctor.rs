@@ -87,9 +87,13 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
             id.email.as_deref().unwrap_or("not logged in"),
             id.org.as_deref().unwrap_or("—")
         );
+        // The account's own settings.json gets its own line, not adopt:
+        // adopt would keep its values as the account's overrides.
+        let mut own_settings = false;
         match p.tool {
             Tool::Claude => {
                 println!("  keychain {}", p.keychain_service());
+                own_settings = settings_line(&ctx.paths, &config, &p, &mut tips);
                 if let Some((own, missing)) = prism_core::trust::status(&ctx.paths, &p, &claude) {
                     println!(
                         "  trust    {own} folder(s) · {missing} trusted on other accounts only{}",
@@ -144,7 +148,8 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
         };
         println!("  token    {t}");
         match share::share_health(&p.dir, common, &rules) {
-            Ok(h) => {
+            Ok(mut h) => {
+                h.to_fix -= usize::from(own_settings && h.to_fix > 0);
                 println!(
                     "  sharing  ok {} · to fix {} · unmanaged {} · {} {}",
                     h.ok,
@@ -244,4 +249,52 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
         }
         Ok(1)
     }
+}
+
+/// Prints how `p`'s `settings.json` stands; true when it is a file of the
+/// account's own.
+fn settings_line(
+    paths: &prism_core::paths::Paths,
+    config: &Config,
+    p: &prism_core::profile::Profile,
+    tips: &mut Vec<String>,
+) -> bool {
+    use prism_core::settings_sync::{SETTINGS, State};
+    if !prism_core::settings_sync::shared(config) {
+        println!("  settings per account ([share] extra_local)");
+        return false;
+    }
+    let next = if config.share.sync_settings {
+        " (merged at next start)"
+    } else {
+        " ([share] sync_settings is off)"
+    };
+    match prism_core::settings_sync::state(paths, p) {
+        State::Linked => println!("  settings shared"),
+        State::Other => println!("  settings not shared (missing or linked elsewhere)"),
+        State::Own { differs, base } => {
+            let what = if differs.is_empty() {
+                "same as common".to_string()
+            } else {
+                format!("differs in {}", differs.join(", "))
+            };
+            if base || differs.is_empty() {
+                println!("  settings own copy · {what}{next}");
+            } else {
+                println!("  settings own copy · {what} · from before agp kept a base");
+                let common = p.common_home.join(SETTINGS);
+                tips.push(format!(
+                    "{}: its settings.json differs from {} in {}; put the values you want \
+                     in that file, then run: ln -sf {} {}",
+                    p.id,
+                    common.display(),
+                    differs.join(", "),
+                    common.display(),
+                    p.dir.join(SETTINGS).display()
+                ));
+            }
+            return true;
+        }
+    }
+    false
 }

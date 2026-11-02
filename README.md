@@ -380,6 +380,17 @@ refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
   before Claude starts, agent-prism adds the other accounts' trusted folders
   to that account's `.claude.json` (it never removes trust). Turn it off with
   `[share] sync_trust = false`.
+- Settings stay shared. Some of Claude's settings writes replace an
+  account's `settings.json` link with a file of its own, so a setting
+  saved there (an effort, a model) stays in that account. Before Claude
+  starts, agent-prism merges such a file back into `~/.claude/settings.json`
+  and links it again (the files it replaces are kept in
+  `~/.local/state/agent-prism/settings-sync/`). A copy that drifted before
+  agent-prism first saw the account linked is left alone; `agp doctor` shows
+  what differs and how to link it. Turn it off with
+  `[share] sync_settings = false`.
+- A switch keeps the session's effort: an effort chosen with `/effort`
+  comes back as `--effort` when Claude restarts on the other account.
 - A Codex account is a `CODEX_HOME` dir (`~/.codex-<id>`). Its login
   (`auth.json`) stays in the dir; `config.toml`, `AGENTS.md`, skills,
   prompts, memories and the session files are symlinks into `~/.codex`.

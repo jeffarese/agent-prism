@@ -17,5 +17,6 @@ pub mod paths;
 pub mod procs;
 pub mod profile;
 pub mod registry;
+pub mod settings_sync;
 pub mod share;
 pub mod trust;

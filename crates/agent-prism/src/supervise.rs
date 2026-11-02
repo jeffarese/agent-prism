@@ -499,6 +499,9 @@ impl Run<'_> {
         first: bool,
     ) -> Result<Outcome> {
         let program = self.ctx.tool_bin(&self.config, self.tool())?;
+        if self.tool() == Tool::Claude {
+            prism_core::settings_sync::sync(&self.ctx.paths, &self.config);
+        }
         let started_ms = unix_now() * 1000;
         let mut cmd = Command::new(&program);
         let resume = session.zip(prompt);

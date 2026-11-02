@@ -111,6 +111,7 @@ env = {}                 # extra env for this profile
 extra_shared = []        # entry names to add to the shared set
 extra_local = []         # entry names to force local
 sync_trust = true        # give every Claude account the folder trust of the others (§4.7)
+sync_settings = true     # fold an account's own settings.json back into the common one (§4.2)
 ```
 
 `dir` is stored with `~`; it is expanded to an absolute path with no trailing
@@ -153,6 +154,27 @@ Every top-level entry of a profile dir is in one class:
 `*.premerge`, unknown names). agent-prism never changes them; `doctor` lists them.
 
 `share.extra_shared` / `share.extra_local` move names between classes.
+
+**Keeping `settings.json` shared.** Some of Claude's settings writes
+(Claude Code 2.1.x stages them in `<profile>/.cc-writes`) rename a new
+file over the link, so the change stays in that account and the accounts
+drift apart (a different effort after each switch). Before Claude starts (interactive, print, background
+launch and move), `settings_sync::sync` folds each such file back into
+`<common>/settings.json` and links it again, under
+`<state>/settings-sync.lock` (1 s, else skipped). The merge is three-way
+against the account's base: `<common>/settings.json` as it was at the
+last sync that found the account linked (`<state>/settings-base.json`). A
+value only the account changed takes the account's, a value only common
+changed keeps common's, a value both changed takes the newer file's;
+objects merge key by key. The files it replaces are kept in
+`<state>/settings-sync/`: `<time>-<id>.json` (the account's) and
+`<time>-common.json` (common before a merge). A file with no base (it drifted
+before agent-prism kept one) is left alone: there is no telling which side
+changed; `doctor` lists the keys that differ and the steps to link it
+again. A file equal to common is linked again at once. The common file is
+written through a link (a dotfiles repo) with its mode kept. `adopt` is not
+the fix for such a file: it keeps the account's values as overrides in the
+overlay. `share.sync_settings = false` turns it off.
 
 Why `projects` is shared: transcripts must be visible to every account so
 that `claude --resume <id>` works after a switch; auto-memory also lives
@@ -672,6 +694,15 @@ user ("Switch account now" in the menu, pick a target or "best").
    The prompt is a one-line note (account, limit, and that background tasks
    and subagents of the old process have stopped), a blank line, then
    `resume_prompt`. The transcript scan reads at most the last 64 MB.
+   Claude starts a resumed session on the default effort, so an effort the
+   session chose in Claude since agent-prism launched it (the last
+   `/effort` or `/model` picker output in the transcript, newer than the
+   launch) comes back as `--effort <level>` in place of the launch's
+   `--effort`; `/effort auto` drops the launch's. This holds for every
+   restart with `--resume`, the wait on the same account too. The user
+   args are read the way Claude's parser reads them (values of
+   `--effort`, list flags such as `--add-dir a b`, optional values), so a
+   flag's value is never taken for the prompt.
 6. If the new child exits non-zero within 5 s, show the error and offer
    "go back".
 7. Requires shared `projects/` in both profiles; else the switch item is
@@ -1014,7 +1045,9 @@ the pool too) after the same two checks.
    old account (`[claude] args` and the profile's `args`, as recorded in
    `launch.added` for that profile when its job was started), puts the
    target's in front (recorded for the target) and passes the target's
-   settings file (above). The prompt: a one-line note ("This session moved from
+   settings file (above), and an effort chosen in the session since its
+   record was made comes back as `--effort` (§9 step 5). The wake form takes
+   no flags, so the woken job keeps the effort of its own launch. The prompt: a one-line note ("This session moved from
    account A to B after the 5-hour limit" / "on request" for
    `agp bg move` / "agent-prism waited for the reset on the same account
    (A) after the 5-hour limit"; "the old process's background tasks and

@@ -599,6 +599,7 @@ impl SessionHost {
         let start = Start::Resume {
             session_id: sid,
             prompt: Some(prompt),
+            effort: self.session_effort(),
         };
         match self.builder.build(&self.config, &profile, &start) {
             Ok((spec, _)) => {
@@ -617,6 +618,16 @@ impl SessionHost {
             self.set_message(MessageLevel::Info, format!("Staying on {label}"));
             self.write_registry();
         }
+    }
+
+    /// The effort the session chose in Claude since agp launched it, which
+    /// a restart with `--resume` would otherwise drop.
+    fn session_effort(&self) -> Option<crate::transcript::Effort> {
+        if self.tool != Tool::Claude {
+            return None;
+        }
+        let path = self.transcript.as_deref()?;
+        crate::transcript::last_effort(path, self.started_at)
     }
 
     /// The first prompt after the limit switch `p`, or `None` when Claude
@@ -710,6 +721,7 @@ impl SessionHost {
         let start = Start::Resume {
             session_id: sid.clone(),
             prompt,
+            effort: self.session_effort(),
         };
         let spec = match self.builder.build(&self.config, &profile, &start) {
             Ok((spec, _)) => spec,
@@ -767,6 +779,7 @@ impl SessionHost {
         let start = Start::Resume {
             session_id: sid,
             prompt: None,
+            effort: self.session_effort(),
         };
         match self.builder.build(&self.config, &prev, &start) {
             Ok((spec, _)) => {

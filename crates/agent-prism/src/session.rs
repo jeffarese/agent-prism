@@ -268,6 +268,9 @@ pub(crate) fn run_print(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
         Prepared::Exit(code) => Ok(code),
         Prepared::Plain(cmd) => exec_print(cmd, tool),
         Prepared::Account(a) => {
+            if tool == Tool::Claude {
+                prism_core::settings_sync::sync(&ctx.paths, &a.config);
+            }
             let now = unix_now();
             let journal = Recorder::new(ctx.paths.clone(), tool, RunMode::Exec, now);
             let mut ev = journal.event(EventKind::Start, &a.profile.id, now);

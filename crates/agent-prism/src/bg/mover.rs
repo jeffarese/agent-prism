@@ -275,13 +275,23 @@ pub fn candidates(env: &Env, s: &Session) -> Vec<Profile> {
 /// again for `target`.
 fn flags_for(env: &Env, s: &Session, target: &Profile) -> (Vec<String>, Option<Vec<String>>) {
     let flags = s.job.respawn_flags.clone();
+    // An effort chosen in the session (`/effort`) since its launch: the
+    // saved flags only have the launch's.
+    let effort = crate::transcript::find(&s.from.dir.join("projects"), &s.cwd, &s.sid)
+        .and_then(|t| crate::transcript::last_effort(&t, s.created_at));
+    if let Some(e) = &effort {
+        log::info!("bg {}: resume with effort {e}", s.short);
+    }
     let Some(l) = &s.launch else {
-        return (flags, None);
+        return (launch::effort_args(&flags, effort.as_ref()), None);
     };
     let old = l.added.get(&s.from.id).map_or(&[][..], Vec::as_slice);
     let added = crate::session::added_args(&env.config, target);
     let mut out = added.clone();
-    out.extend(job::remove_args(&flags, old));
+    out.extend(launch::effort_args(
+        &job::remove_args(&flags, old),
+        effort.as_ref(),
+    ));
     let settings = match &l.key {
         Some(key) => super::settings::value(
             &env.app.paths,
@@ -585,6 +595,7 @@ fn resume_in(env: &Env, s: &Session, target: &Profile, prompt: String) -> Result
     // A profile that has the job takes the no-flag form; flags would start
     // a copy under a new id.
     let has_job = job::job_dir(&target.dir, short).is_dir();
+    prism_core::settings_sync::sync(&env.app.paths, &env.config);
     let flags = prepare_resume(env, s, target, has_job);
     let args = job::resume_args(&s.sid, flags.as_deref(), &prompt);
     log::info!(

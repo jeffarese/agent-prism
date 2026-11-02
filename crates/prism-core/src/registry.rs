@@ -8,13 +8,13 @@
 //! accounts. Picks that write a claim hold the pick lock ([`PickLock`]).
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::fsutil::FileLock;
 use crate::journal::RunMode;
 use crate::model::Tool;
 use crate::paths::Paths;
@@ -199,47 +199,24 @@ pub fn list_live(paths: &Paths) -> Vec<SessionRecord> {
 /// execs: the file is close-on-exec).
 #[derive(Debug)]
 pub struct PickLock {
-    _file: File,
+    _lock: FileLock,
 }
 
 impl PickLock {
     /// Waits up to `wait` for the lock. `None` on timeout or error (the
     /// caller then picks without it; a launch never fails for this).
     pub fn acquire(paths: &Paths, wait: Duration) -> Option<PickLock> {
-        use std::os::fd::AsRawFd;
         let path = paths.state_dir.join("pick.lock");
-        if let Err(e) = std::fs::create_dir_all(&paths.state_dir) {
-            log::warn!("pick lock: {e}");
-            return None;
-        }
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-        {
-            Ok(f) => f,
+        match FileLock::acquire(&path, wait) {
+            Ok(Some(l)) => Some(PickLock { _lock: l }),
+            Ok(None) => {
+                log::warn!("pick lock busy for {wait:?}; picking without it");
+                None
+            }
             Err(e) => {
                 log::warn!("pick lock {}: {e}", path.display());
-                return None;
+                None
             }
-        };
-        let deadline = Instant::now() + wait;
-        loop {
-            // SAFETY: flock on a descriptor we own.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Some(PickLock { _file: file });
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                log::warn!("pick lock: {err}");
-                return None;
-            }
-            if Instant::now() >= deadline {
-                log::warn!("pick lock busy for {wait:?}; picking without it");
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(15));
         }
     }
 }

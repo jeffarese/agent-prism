@@ -25,6 +25,7 @@ use serde_json::{Map, Value};
 
 use crate::app::AppCtx;
 use crate::tokens::KeychainTokens;
+use crate::transcript::Effort;
 
 /// Hook events agent-prism registers (DESIGN §8).
 pub const HOOK_EVENTS: [&str; 5] = [
@@ -46,36 +47,136 @@ const SESSION_FLAGS: [&str; 6] = [
 ];
 const FROM_PR: &str = "--from-pr";
 
-/// Claude flags that take a value (for finding a trailing positional prompt).
-const VALUE_FLAGS: [&str; 27] = [
-    "--model",
-    "--agent",
-    "--agents",
-    "--append-system-prompt",
-    "--system-prompt",
-    "--permission-mode",
-    "--fallback-model",
-    "--settings",
-    "--setting-sources",
-    "--mcp-config",
-    "--add-dir",
-    "--allowedTools",
-    "--allowed-tools",
-    "--disallowedTools",
-    "--disallowed-tools",
-    "--tools",
-    "--output-format",
-    "--input-format",
-    "--session-id",
-    "-r",
-    "--resume",
-    "--name",
-    "-n",
-    "--max-budget-usd",
-    "--plugin-dir",
-    "--debug",
-    "--from-pr",
+/// The words a Claude flag takes after it, as Claude's parser (Commander)
+/// reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arity {
+    /// The next word, even one that starts with `-`.
+    One,
+    /// The next word unless it starts with `-`.
+    Optional,
+    /// The next word, then each word up to one that starts with `-`.
+    Many,
+}
+
+/// Claude flags that take a value (`claude --help`, 2.1.316). An unknown
+/// flag counts as taking none.
+const VALUE_FLAGS: [(&str, Arity); 46] = [
+    ("--add-dir", Arity::Many),
+    ("--agent", Arity::One),
+    ("--agents", Arity::One),
+    ("--allowedTools", Arity::Many),
+    ("--allowed-tools", Arity::Many),
+    ("--append-system-prompt", Arity::One),
+    ("--autocompact", Arity::One),
+    ("--betas", Arity::Many),
+    ("--cloud", Arity::Optional),
+    ("-d", Arity::Optional),
+    ("--debug", Arity::Optional),
+    ("--debug-file", Arity::One),
+    ("--disallowedTools", Arity::Many),
+    ("--disallowed-tools", Arity::Many),
+    ("--effort", Arity::One),
+    ("--environment", Arity::One),
+    ("--fallback-model", Arity::One),
+    ("--fast-mode", Arity::One),
+    ("--file", Arity::Many),
+    (FROM_PR, Arity::Optional),
+    ("--input-format", Arity::One),
+    ("--json-schema", Arity::One),
+    ("--max-budget-usd", Arity::One),
+    ("--mcp-config", Arity::Many),
+    ("--model", Arity::One),
+    ("-n", Arity::One),
+    ("--name", Arity::One),
+    ("--output-format", Arity::One),
+    ("--permission-mode", Arity::One),
+    ("--permission-prompts", Arity::One),
+    ("--plugin-dir", Arity::One),
+    ("--plugin-url", Arity::One),
+    ("--prompt-suggestions", Arity::Optional),
+    ("--remote-control", Arity::Optional),
+    ("--remote-control-session-name-prefix", Arity::One),
+    ("-r", Arity::Optional),
+    ("--resume", Arity::Optional),
+    ("--session-id", Arity::One),
+    ("--setting-sources", Arity::One),
+    ("--settings", Arity::One),
+    ("--system-prompt", Arity::One),
+    ("--system-prompt-snapshot", Arity::One),
+    ("--teleport", Arity::Optional),
+    ("--tools", Arity::Many),
+    ("-w", Arity::Optional),
+    ("--worktree", Arity::Optional),
 ];
+
+fn arity(flag: &str) -> Option<Arity> {
+    VALUE_FLAGS
+        .iter()
+        .find(|(f, _)| *f == flag)
+        .map(|(_, a)| *a)
+}
+
+/// A word that Claude's parser reads as a flag (`-` alone is a value).
+fn is_flag(a: &str) -> bool {
+    a.len() > 1 && a.starts_with('-')
+}
+
+/// One unit of the options: a flag with its values, or a positional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Part {
+    /// `opts[start..end]`.
+    start: usize,
+    end: usize,
+    flag: bool,
+}
+
+/// `opts` (the args before `--`) split the way Claude's parser reads them.
+fn parts(opts: &[String]) -> Vec<Part> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < opts.len() {
+        let start = i;
+        let a = opts[i].as_str();
+        i += 1;
+        if !is_flag(a) {
+            out.push(Part {
+                start,
+                end: i,
+                flag: false,
+            });
+            continue;
+        }
+        // `--flag=value` carries its value.
+        let inline = a.starts_with("--") && a.contains('=');
+        match arity(a).filter(|_| !inline) {
+            Some(Arity::One) => i = (i + 1).min(opts.len()),
+            Some(Arity::Optional) => {
+                if opts.get(i).is_some_and(|n| !is_flag(n)) {
+                    i += 1;
+                }
+            }
+            Some(Arity::Many) => {
+                i = (i + 1).min(opts.len());
+                while opts.get(i).is_some_and(|n| !is_flag(n)) {
+                    i += 1;
+                }
+            }
+            None => {}
+        }
+        out.push(Part {
+            start,
+            end: i,
+            flag: true,
+        });
+    }
+    out
+}
+
+fn is_session_flag(a: &str) -> bool {
+    let f = flag_name(a);
+    SESSION_FLAGS.contains(&f) || f == FROM_PR
+}
 
 /// Current unix time in seconds.
 pub fn unix_now() -> i64 {
@@ -113,91 +214,71 @@ fn flag_name(a: &str) -> &str {
 
 /// True if the user chose a session (resume, continue, fixed id, ...).
 pub fn has_session_flag(args: &[String]) -> bool {
-    options(args).iter().any(|a| {
-        let f = flag_name(a);
-        SESSION_FLAGS.contains(&f) || f == FROM_PR
-    })
+    options(args).iter().any(|a| is_session_flag(a))
 }
 
 /// True if the claude args carry a prompt: a positional, or anything after
 /// `--` (a session started with one works on a turn at once).
 pub fn has_prompt(args: &[String]) -> bool {
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        if a == "--" {
-            return it.next().is_some();
-        }
-        if !a.starts_with('-') {
-            return true;
-        }
-        if a.contains('=') && a.starts_with("--") {
-            continue;
-        }
-        if matches!(a.as_str(), "-r" | "--resume" | FROM_PR) {
-            // An optional value.
-            if it.peek().is_some_and(|n| !n.starts_with('-')) {
-                it.next();
-            }
-        } else if VALUE_FLAGS.contains(&a.as_str()) {
-            it.next();
-        }
-    }
-    false
+    let opts = options(args);
+    parts(opts).iter().any(|p| !p.flag) || args.len() > opts.len() + 1
+}
+
+/// The parts of `args` without the session flags (and their values).
+fn kept_parts(opts: &[String]) -> Vec<Part> {
+    parts(opts)
+        .into_iter()
+        .filter(|p| !(p.flag && is_session_flag(&opts[p.start])))
+        .collect()
+}
+
+fn join(opts: &[String], parts: &[Part]) -> Vec<String> {
+    parts
+        .iter()
+        .flat_map(|p| opts[p.start..p.end].iter().cloned())
+        .collect()
 }
 
 /// The args without the user's session flags (and their values) and without
 /// a trailing positional prompt (or anything after `--`). Used when resuming
 /// on another account.
 pub fn strip_for_switch(args: &[String]) -> Vec<String> {
-    let args = options(args);
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        let f = flag_name(a);
-        let inline = a.contains('=') && a.starts_with("--");
-        if SESSION_FLAGS.contains(&f) || f == FROM_PR {
-            // --session-id always takes a value; -r/--resume/--from-pr take
-            // an optional one.
-            let takes = matches!(f, "--session-id" | "-r" | "--resume" | FROM_PR);
-            let next_is_value = args.get(i + 1).is_some_and(|n| !n.starts_with('-'));
-            i += 1;
-            if takes && !inline && (f == "--session-id" || next_is_value) {
-                i += 1;
-            }
-            continue;
-        }
-        out.push(a.clone());
-        i += 1;
+    let opts = options(args);
+    let mut kept = kept_parts(opts);
+    if kept.last().is_some_and(|p| !p.flag) {
+        kept.pop();
     }
-    if let Some(last) = out.last()
-        && !last.starts_with('-')
-    {
-        let prev_takes_value = out.len() >= 2 && VALUE_FLAGS.contains(&out[out.len() - 2].as_str());
-        if !prev_takes_value {
-            out.pop();
-        }
-    }
-    out
+    join(opts, &kept)
 }
 
 /// The args for a print-mode resume: [`strip_for_switch`] and also every
 /// other positional (the prompt can sit anywhere among the flags of
 /// `claude -p`).
 pub fn strip_positionals(args: &[String]) -> Vec<String> {
-    let args = strip_for_switch(args);
-    let mut out = Vec::new();
-    let mut it = args.into_iter();
-    while let Some(a) = it.next() {
-        if !a.starts_with('-') {
-            continue;
-        }
-        let takes = !a.contains('=') && VALUE_FLAGS.contains(&a.as_str());
-        out.push(a);
-        if takes && let Some(v) = it.next() {
-            out.push(v);
-        }
+    let opts = options(args);
+    let kept: Vec<Part> = kept_parts(opts).into_iter().filter(|p| p.flag).collect();
+    join(opts, &kept)
+}
+
+/// `args` with the effort a session chose in Claude (`/effort`), which a
+/// resume would lose: every `--effort` among the options goes, and a level
+/// comes back as the last option (Claude takes the last `--effort`).
+/// `None` leaves the args as they are.
+pub fn effort_args(args: &[String], effort: Option<&Effort>) -> Vec<String> {
+    let Some(effort) = effort else {
+        return args.to_vec();
+    };
+    let opts = options(args);
+    let kept: Vec<Part> = parts(opts)
+        .into_iter()
+        .filter(|p| !(p.flag && flag_name(&opts[p.start]) == "--effort"))
+        .collect();
+    let mut out = join(opts, &kept);
+    if let Effort::Level(level) = effort {
+        out.push("--effort".into());
+        out.push(level.clone());
     }
+    out.extend(args[opts.len()..].iter().cloned());
     out
 }
 
@@ -438,6 +519,20 @@ pub fn memory_dir(
     })
 }
 
+/// Before Claude starts on `profile`: the other accounts' folder trust
+/// (`share.sync_trust`, §4.7) and the shared `settings.json`
+/// (`share.sync_settings`, §4.2).
+pub fn sync_shared(paths: &Paths, config: &Config, profile: &Profile) {
+    if profile.tool != Tool::Claude || !(config.share.sync_trust || config.share.sync_settings) {
+        return;
+    }
+    prism_core::settings_sync::sync(paths, config);
+    if config.share.sync_trust {
+        let claude = config.profiles_for(paths, Tool::Claude);
+        prism_core::trust::sync(paths, profile, &claude);
+    }
+}
+
 /// Logs a warning if the transcript dir name differs from agent-prism's key.
 pub fn check_memory_key(transcript: &str, key: &str) -> bool {
     let name = Path::new(transcript)
@@ -465,6 +560,9 @@ pub enum Start {
     Resume {
         session_id: String,
         prompt: Option<String>,
+        /// The effort the session chose in Claude since it launched (see
+        /// [`effort_args`]); Claude starts a resume on the default.
+        effort: Option<Effort>,
     },
 }
 
@@ -522,10 +620,7 @@ impl SpecBuilder {
         }
         // Right before the spawn, so Claude on this account has little time
         // to rewrite the file in between (§4.7).
-        if config.share.sync_trust {
-            let claude = config.profiles_for(&self.paths, Tool::Claude);
-            prism_core::trust::sync(&self.paths, profile, &claude);
-        }
+        sync_shared(&self.paths, config, profile);
         let overlay_path = self.paths.profile_overlay(&profile.id);
         let overlay = match std::fs::read_to_string(&overlay_path) {
             Ok(t) => Some(
@@ -570,8 +665,16 @@ impl SpecBuilder {
                 }
                 args.extend(splice_args(&self.user_args, extra));
             }
-            Start::Resume { session_id, prompt } => {
-                args.extend(strip_for_switch(&self.user_args));
+            Start::Resume {
+                session_id,
+                prompt,
+                effort,
+            } => {
+                if let Some(e) = effort {
+                    log::info!("resume {session_id} with effort {e}");
+                }
+                let user = strip_for_switch(&self.user_args);
+                args.extend(effort_args(&user, effort.as_ref()));
                 args.push("--settings".into());
                 args.push(settings_path.to_string_lossy().into_owned());
                 args.push("--resume".into());
@@ -625,7 +728,9 @@ impl SpecBuilder {
                 crate::codex::resume_target(&self.user_args)
                     .filter(|id| uuid::Uuid::parse_str(id).is_ok()),
             ),
-            Start::Resume { session_id, prompt } => {
+            Start::Resume {
+                session_id, prompt, ..
+            } => {
                 let mut args = vec!["resume".to_string()];
                 args.extend(base);
                 args.extend(crate::codex::strip_for_switch(&self.user_args));
@@ -1074,6 +1179,55 @@ mod tests {
         assert!(!has_prompt(&v(&["--"])));
     }
 
+    /// Values are read the way Claude reads them: `--effort high` has no
+    /// prompt, a list flag takes every word up to the next flag, and an
+    /// optional value is never a flag.
+    #[test]
+    fn values_are_not_prompts() {
+        assert!(!has_prompt(&v(&["--effort", "high"])));
+        assert!(!has_prompt(&v(&["--add-dir", "/a", "/b"])));
+        assert!(!has_prompt(&v(&["-w", "feature"])));
+        assert!(has_prompt(&v(&["-w", "--effort", "max", "fix it"])));
+        assert!(has_prompt(&v(&["--effort=max", "fix it"])));
+        // A required value is taken even when it starts with `-`.
+        assert!(!has_prompt(&v(&["--append-system-prompt", "-x"])));
+        assert_eq!(
+            strip_for_switch(&v(&["--model", "opus", "--effort", "high"])),
+            v(&["--model", "opus", "--effort", "high"])
+        );
+        assert_eq!(
+            strip_for_switch(&v(&["--add-dir", "/a", "/b"])),
+            v(&["--add-dir", "/a", "/b"])
+        );
+        assert_eq!(
+            strip_for_switch(&v(&["--effort", "high", "fix it"])),
+            v(&["--effort", "high"])
+        );
+        assert_eq!(
+            strip_positionals(&v(&["-p", "--effort", "high", "fix it", "-w", "--verbose"])),
+            v(&["-p", "--effort", "high", "-w", "--verbose"])
+        );
+    }
+
+    #[test]
+    fn effort_replaces_the_flags() {
+        let max = Effort::Level("max".into());
+        assert_eq!(
+            effort_args(&v(&["--effort", "low", "-n", "x"]), Some(&max)),
+            v(&["-n", "x", "--effort", "max"])
+        );
+        assert_eq!(
+            effort_args(&v(&["--effort=low", "--", "-x"]), Some(&max)),
+            v(&["--effort", "max", "--", "-x"])
+        );
+        assert_eq!(
+            effort_args(&v(&["--effort", "low", "-n", "x"]), Some(&Effort::Auto)),
+            v(&["-n", "x"])
+        );
+        let a = v(&["--effort", "low"]);
+        assert_eq!(effort_args(&a, None), a);
+    }
+
     #[test]
     fn session_flags() {
         assert!(has_session_flag(&v(&["-c"])));
@@ -1286,6 +1440,7 @@ mod tests {
         let start = Start::Resume {
             session_id: "abc".into(),
             prompt: Some("continue".into()),
+            effort: None,
         };
         let (spec, _) = b.build(&cfg, &p, &start).unwrap();
         let args: Vec<String> = spec
@@ -1295,6 +1450,55 @@ mod tests {
             .collect();
         assert_eq!(args[..3], v(&["--pa", "--model", "opus"]));
         assert_eq!(args[5..], v(&["--resume", "abc", "continue"]));
+    }
+
+    fn args_of(spec: &ChildSpec) -> Vec<String> {
+        spec.args
+            .iter()
+            .map(|a| a.to_string_lossy().into())
+            .collect()
+    }
+
+    /// The incident: `--effort high` last lost its value on a switch, and
+    /// the dangling `--effort` ate `--settings`.
+    #[test]
+    fn spec_resume_keeps_a_trailing_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = builder(dir.path(), &["--model", "opus", "--effort", "high"]);
+        let p = profile("/h/.claude-x", false);
+        let start = Start::Resume {
+            session_id: "abc".into(),
+            prompt: None,
+            effort: None,
+        };
+        let (spec, _) = b.build(&Config::default(), &p, &start).unwrap();
+        let args = args_of(&spec);
+        assert_eq!(args[1..5], v(&["--model", "opus", "--effort", "high"]));
+        assert_eq!(args[5], "--settings");
+        assert_eq!(args[7..], v(&["--resume", "abc"]));
+    }
+
+    #[test]
+    fn spec_resume_carries_the_session_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = builder(dir.path(), &["--effort", "low", "--model", "opus"]);
+        let p = profile("/h/.claude-x", false);
+        let resume = |effort| Start::Resume {
+            session_id: "abc".into(),
+            prompt: None,
+            effort,
+        };
+        let level = Some(Effort::Level("max".into()));
+        let (spec, _) = b.build(&Config::default(), &p, &resume(level)).unwrap();
+        assert_eq!(
+            args_of(&spec)[1..5],
+            v(&["--model", "opus", "--effort", "max"])
+        );
+        // `/effort auto` drops the launch's `--effort`.
+        let (spec, _) = b
+            .build(&Config::default(), &p, &resume(Some(Effort::Auto)))
+            .unwrap();
+        assert_eq!(args_of(&spec)[1..4], v(&["--model", "opus", "--settings"]));
     }
 
     #[test]
@@ -1504,6 +1708,7 @@ mod tests {
         let start = Start::Resume {
             session_id: "s".into(),
             prompt: None,
+            effort: None,
         };
         b.build(&Config::default(), &p, &start).unwrap();
         assert!(read(&b)["autoMemoryDirectory"].is_string());

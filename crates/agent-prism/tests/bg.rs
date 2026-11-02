@@ -569,6 +569,49 @@ fn read_json(path: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// An effort chosen in the session (`/effort`) after its launch survives a
+/// move: the flags form passes it in place of the launch's `--effort`.
+#[test]
+fn move_keeps_the_session_effort() {
+    let s = Setup::new();
+    launch_with(
+        &s,
+        &["--as", "a", "--on-limit", "switch"],
+        &["--effort", "high"],
+    );
+    let rec = s.wait_for("the watcher", |v| {
+        v["watching"] == true && v["watcher_pid"].is_i64()
+    });
+    let short = rec["short_id"].as_str().unwrap().to_string();
+    let sid = rec["session_id"].as_str().unwrap().to_string();
+    let transcript = s
+        .root
+        .join("home/.claude/projects/-work")
+        .join(format!("{sid}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let line = serde_json::json!({"type": "user", "timestamp": jiff::Timestamp::now().to_string(),
+        "message": {"role": "user", "content":
+            "<local-command-stdout>Set effort level to max (this session only): Maximum</local-command-stdout>"}});
+    std::fs::write(&transcript, format!("{line}\n")).unwrap();
+
+    let (code, _, err) = s.run(&["bg", "move", &short, "--to", "b"]);
+    assert_eq!(code, 0, "{err}\n{}", s.log_text());
+    let log = s.log_text();
+    let b_line = log
+        .lines()
+        .find(|l| {
+            l.starts_with(&format!("cfg={} ", s.dir("b").display())) && l.contains("--resume")
+        })
+        .unwrap();
+    assert!(
+        b_line.contains(&format!(
+            "args=--bg --resume {sid} --name n --effort max --settings "
+        )),
+        "{b_line}"
+    );
+    assert!(!b_line.contains("--effort high"), "{b_line}");
+}
+
 #[test]
 fn settings_files_and_profile_args() {
     let s = Setup::with_args(

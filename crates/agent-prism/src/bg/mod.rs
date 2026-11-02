@@ -75,10 +75,7 @@ pub fn launch(ctx: &AppCtx, args: &LaunchArgs) -> Result<i32> {
     // The pick's claim holds the account until the session's record
     // counts it (`running`), and goes when the launch returns.
     let _claim = LaunchClaim(&ctx.paths);
-    if config.share.sync_trust {
-        let claude = config.profiles_for(&ctx.paths, Tool::Claude);
-        prism_core::trust::sync(&ctx.paths, &profile, &claude);
-    }
+    crate::launch::sync_shared(&ctx.paths, &config, &profile);
     let started = unix_now();
     let (code, stdout) = passthrough(cmd)?;
     if code != 0 {
