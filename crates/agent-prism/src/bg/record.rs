@@ -568,6 +568,21 @@ mod tests {
         assert_eq!(o.run(), run);
     }
 
+    /// Whether `f` holds within a moment. A lock (or probe) this process
+    /// just let go can stay held briefly: a child that another test forks
+    /// keeps a copy of every open file until its exec, and the `pre_exec`
+    /// of [`crate::bg::claude::spawn_detached`] makes that window long.
+    fn soon(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !f() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     #[test]
     fn update_find_and_locks() {
         let dir = tempfile::tempdir().unwrap();
@@ -586,7 +601,10 @@ mod tests {
         assert_eq!(list(&paths).len(), 1);
 
         assert!(!watcher_alive(&paths, sid));
-        let l = Lock::try_take(&watcher_lock(&paths, sid)).unwrap().unwrap();
+        // The probe just above can still hold its shared lock (see `soon`).
+        let l = Lock::wait(&watcher_lock(&paths, sid), Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         // flock locks belong to the open file: a second open in this
         // process conflicts like another process would.
         assert!(
@@ -597,7 +615,7 @@ mod tests {
         assert!(watcher_alive(&paths, sid));
         assert!(list(&paths)[0].watching);
         drop(l);
-        assert!(!watcher_alive(&paths, sid));
+        assert!(soon(|| !watcher_alive(&paths, sid)));
 
         // Nobody watches and the job is gone: ended.
         let jobs = dir.path().join("cfg/jobs/f1de9de1");
@@ -609,6 +627,6 @@ mod tests {
         .unwrap();
         assert_eq!(list(&paths)[0].state, State::Watching);
         std::fs::remove_dir_all(&jobs).unwrap();
-        assert_eq!(list(&paths)[0].state, State::Ended);
+        assert!(soon(|| list(&paths)[0].state == State::Ended));
     }
 }
