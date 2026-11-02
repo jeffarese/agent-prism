@@ -79,6 +79,7 @@ agp --bg "task"         # a Claude Code background session; limits handled
 agp bg                  # background sessions agp watches (--json)
 agp status              # usage table of all accounts (--json, --watch)
 agp dashboard           # usage, history and runs in the browser
+agp learn               # how heavy past sessions in this repo were (--all, --json)
 agp skill install       # teach Claude, Codex and other agents to use agp
 agp skill list          # where the agp skill is installed, and if it is current
 agp pick --codex        # the ChatGPT account a new session would use
@@ -151,6 +152,12 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
   now) and `usable` per account, and `capacity`: how many more runs fit
   before every account nears `soft_5h`.
 - Moves on a limit are spread the same way.
+- `agp learn` shows how much past sessions in the current repository burned,
+  by kind of task (solo, with agents, workflow) and by effort, read from
+  Claude Code's transcripts. agent-prism keeps these summaries (also after
+  Claude Code deletes old transcripts) and archives usage samples, so the
+  balancer can later weigh runs by repository and task. A launch refreshes
+  them in the background every 6 hours; nothing leaves the machine.
 - `agp -p` gives each Claude run a session id. A resume (`--resume <id>`,
   `-c`, `codex exec resume`) starts on the account that last ran that
   conversation, where its prompt cache is, if it is not limited and has room.

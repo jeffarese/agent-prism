@@ -1110,6 +1110,9 @@ fn take_snapshot(
         tokens,
         Duration::from_millis(2500),
     );
+    if lock {
+        crate::learn::maybe_start(&app.paths, now);
+    }
     let lock = lock
         .then(|| registry::PickLock::acquire(&app.paths, PICK_WAIT))
         .flatten();

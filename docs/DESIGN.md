@@ -46,6 +46,7 @@ proxy setup) is never offered as an account.
 | Run journal | `<state>/runs.jsonl` (cut to its newest half at 8 MB) | |
 | Background sessions | `<state>/bg/<session id>.json` (+ `.lock`, `.act.lock`, `.rec.lock`) | |
 | Their `--settings` files | `<state>/bg/settings/<launch key>-<profile id>.json` | |
+| Learning (§11f) | `<state>/learn/sessions.jsonl`, `empty.json`, `samples/<profile>.jsonl`, `accounts.json`, `state.json`, `harvest.lock` | `AGP_NO_LEARN=1` (no background harvest) |
 
 All path defaults are computed in one place (`prism_core::paths`). Library
 functions take paths as parameters so that tests use temp dirs. Tests must
@@ -453,7 +454,9 @@ sessions average ~5%/h (mostly idle: 0.25 × 25 ≈ 6), a session's first hour
 ~14%/h (about 40% of it working). A per-account rate learned from the
 journal was tried and left out: the journal has no busy time, so it measures
 open sessions, not working runs, and would undercount lanes; the burn-rate
-term already adapts to what an account really uses.
+term already adapts to what an account really uses. Per-session burn read from
+the transcripts is collected (§11f) for a later per-repository estimate;
+the balancer does not use it yet.
 
 - **Limited**: `u5h >= hard`, or `u7d >= 100 - reserve_7d`, or a scoped
   window for the session's model `>= hard`. Limited accounts are never
@@ -1182,6 +1185,87 @@ alone (skipped).
   `up to date (same folder as …)`).
 - Uninstall removes the files agp wrote and the manifest, then the folder
   if nothing else is in it; a symlink is left as it is.
+
+## 11f. Learning (`agp learn`)
+
+Code: `crates/agent-prism/src/learn/` (`scan.rs` reads transcripts,
+`store.rs` the store, `report.rs` the output). The goal: know how heavy a
+repository's kinds of task are, from past sessions, so that a later
+balancer can weigh a new run by its repository and task instead of the flat
+`run_load`, and keep the data to analyze it. Nothing leaves the machine.
+
+**Harvest.** Reads every Claude session under the `projects/` folders (the
+common home's and each Claude profile's, once each after `canonicalize`)
+whose transcripts changed since the last harvest (size and newest mtime of
+the main file and all agent files), and rewrites the store. A session id
+found in two folders (a renamed project folder) is read from the larger
+copy. Sessions with no model response are not stored; their fingerprints
+in `empty.json` keep them from being read again. Summaries stay after
+Claude Code deletes the transcripts (`cleanupPeriodDays`, 30 by default),
+for 400 days after the session's end. It then fills `agp` from the run
+journal (§11b): the run, mode, accounts in order and limits hit, for each
+session a journal line names (a later run that resumed the session adds its
+accounts). It also appends the usage cache's samples (§6.4, kept 7 days)
+to `samples/<profile>.jsonl`, one per 5 minutes (the last of each ended
+step), kept 400 days, and writes each Claude account's plan (label,
+subscription, rate-limit tier, capacity) to `accounts.json` when its
+credentials can be read. A full read of ~600 sessions (5 GB) takes about
+4 s; an unchanged store about 0.1 s.
+
+**When.** `agp learn` harvests in the foreground (waiting up to 120 s for a
+running harvest, else it shows what is stored). A launch pick that takes
+the pick lock (§6.6) starts `agp _learn` detached when the last harvest
+started 6 h ago or more and no harvest holds `harvest.lock`. Off with
+`AGP_NO_LEARN` or `AGP_NO_POLL`.
+
+**Reading a session** (`scan.rs`). The format is Claude Code's and not
+documented; lines that don't parse are skipped. Files: the main
+`<session>.jsonl`, plain agents `<session>/subagents/*.jsonl` and workflow
+agents `<session>/subagents/workflows/<run>/*.jsonl`. Only `assistant`
+lines, `ai-title` lines and `user` lines up to the first prompt are
+parsed. Claude Code writes one line per content block of a response and
+repeats the response's `usage` on each (checked with Claude Code 2.1.312),
+so usage counts once per `message.id` (else `requestId`), the larger value
+of each count. `<synthetic>` responses and empty usage don't count.
+
+**A summary** (`sessions.jsonl`, one JSON line each, `v` = 1; an older `v`
+is read again while its transcripts exist):
+
+| Field | Meaning |
+| --- | --- |
+| `session`, `cwd`, `branch` | first `cwd` and `gitBranch` of the main transcript |
+| `repo` | the folder holding `.git`; a worktree's `.git` file points to its main work tree; a folder that is gone: the part before `/.claude/worktrees/`, else the folder |
+| `start`, `end` | first and last model response, all agents |
+| `work_secs` | sum of the gaps of at most 5 min between responses, all agents |
+| `entry`, `effort`, `model` | `entrypoint` (`cli`, `sdk-cli`, `claude-desktop`, ...), the main conversation's most used `effort`, its model with the most kU |
+| `prompt`, `title` | the first prompt typed (whitespace collapsed, 200 characters; local command output, reminders and caveats skipped), Claude Code's `aiTitle` |
+| `tokens` | per model: `input`, `cache_write`, `cache_read`, `output` |
+| `ku`, `main_ku` | kU of all agents and of the main conversation |
+| `agents`, `workflows`, `workflow_agents` | counts of agent transcripts and workflow runs |
+| `tools` | the main conversation's tool calls by name |
+| `peak30_ku`, `buckets` | most kU in 30 min; `[start, kU]` per 5 min, to set against the archived usage samples |
+| `agp` | `{run, mode, accounts: [[since, profile]], limits}` from the journal |
+| `src_bytes`, `src_mtime` | the transcripts' fingerprint when read |
+
+kU (thousand input-token equivalents) = (input + 1.25 × cache write + 0.1
+× cache read + 5 × output) / 1000, the API's price ratios, the same for
+every model. It ranks sessions; turning it into % of an account's 5h window
+needs the archived samples and the accounts' plans (a later step).
+
+**Kinds**: `workflow` (a workflow run or a `Workflow` call), `5+ agents`,
+`1-4 agents`, `solo`. Burn = kU per working hour, for sessions with 3+
+working minutes.
+
+**`agp learn [<path>] [--all] [--json]`**: harvests, then shows the
+repository of `path` (default: the current folder, through `repo_root`):
+the sessions, their date range, the median burn over all repositories
+("typical"), a table by kind and by effort (sessions, median, p75, p90 by
+nearest rank, median × typical, median working time) and the latest 12
+sessions (start, kind, effort, working time, burn, accounts and limits from
+the journal, title or prompt). `--all`: one line per repository, most
+sessions first. `--json`: the same data (`RepoReport` or a list of
+`RepoLine`). `learn` is a reserved word like `status` (with `-p` the line
+goes to claude).
 
 ## 12. Codex (ChatGPT plans)
 

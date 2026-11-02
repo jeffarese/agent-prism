@@ -5,8 +5,8 @@
 //! Environment hooks for automated tests only:
 //! - `AGP_SECRET_STORE_FILE=<json map service→value>`: read credentials
 //!   from this file instead of `/usr/bin/security`.
-//! - `AGP_NO_POLL=1`: no usage poller and no launch-time refresh; the
-//!   cache files are used as they are.
+//! - `AGP_NO_POLL=1`: no usage poller, no launch-time refresh and no
+//!   background learning harvest; the cache files are used as they are.
 //! - `AGP_BG_POLL_MS=<n>`: the background watcher polls every n ms
 //!   instead of 10 s.
 
@@ -22,6 +22,7 @@ mod doctor;
 mod hooks;
 mod host;
 mod launch;
+mod learn;
 mod live;
 mod logging;
 mod nudge;
@@ -105,6 +106,8 @@ fn run(args: Vec<OsString>) -> Result<i32> {
         ),
         Command::Exec { profile, cmd } => run_exec(&ctx, &profile, &cmd),
         Command::Bg(b) => bg::run(&ctx, b),
+        Command::Learn(opts) => learn::run(&ctx, opts),
+        Command::LearnBackground => learn::run_background(&ctx),
         Command::Hook(_) | Command::Help | Command::Version => Ok(0),
     }
 }

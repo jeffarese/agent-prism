@@ -173,6 +173,11 @@ pub enum Command {
     },
     /// `agp bg …`: background sessions (DESIGN §11d).
     Bg(BgCommand),
+    /// `agp learn [<path>] [--all] [--json]`: what agp learned from past
+    /// sessions (DESIGN §11f).
+    Learn(crate::learn::LearnOpts),
+    /// `agp _learn`: a background harvest (internal, detached).
+    LearnBackground,
     Hook(String),
     Help,
     Version,
@@ -233,6 +238,10 @@ Usage:
   agp pick [--json] [--codex] [--n <k>]
                                       the account a new session would use; --n: the
                                       next k runs, each counting the ones before
+  agp learn [<path>] [--all] [--json]
+                                      burn of past sessions in this repository
+                                      by kind of task and effort; --all: every
+                                      repository
   agp settings                      settings (full screen)
   agp dashboard [--port <n>] [--no-open] [--allow-host <name>]
                                       usage dashboard in the browser
@@ -409,6 +418,7 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
         "doctor",
         "adopt",
         "bg",
+        "learn",
         "codex",
         "help",
         "-h",
@@ -458,6 +468,19 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
                 n,
             }
         }
+        "learn" => {
+            let mut opts = crate::learn::LearnOpts::default();
+            for a in rest() {
+                match a.as_str() {
+                    "--all" => opts.all = true,
+                    "--json" => opts.json = true,
+                    _ if !a.starts_with('-') && opts.path.is_none() => opts.path = Some(a),
+                    _ => bail!("usage: agp learn [<path>] [--all] [--json]"),
+                }
+            }
+            Command::Learn(opts)
+        }
+        "_learn" => Command::LearnBackground,
         "_nudge" => match rest().as_slice() {
             [id] => Command::Nudge { id: id.clone() },
             _ => bail!("usage: agp _nudge <account id>"),
@@ -712,6 +735,32 @@ mod tests {
             Command::Launch(l) => l,
             other => panic!("not launch: {other:?}"),
         }
+    }
+
+    #[test]
+    fn learn() {
+        use crate::learn::LearnOpts;
+        assert_eq!(p(&["learn"]), Command::Learn(LearnOpts::default()));
+        assert_eq!(
+            p(&["learn", "../app", "--json"]),
+            Command::Learn(LearnOpts {
+                path: Some("../app".into()),
+                all: false,
+                json: true,
+            })
+        );
+        assert_eq!(
+            p(&["learn", "--all"]),
+            Command::Learn(LearnOpts {
+                all: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(p(&["_learn"]), Command::LearnBackground);
+        let a: Vec<OsString> = ["learn", "a", "b"].iter().map(OsString::from).collect();
+        assert!(parse(&a).is_err());
+        // With -p the line goes to claude, as for the other words.
+        assert!(matches!(p(&["learn", "-p"]), Command::Launch(_)));
     }
 
     #[test]

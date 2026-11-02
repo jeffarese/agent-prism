@@ -9,7 +9,7 @@ pub mod codex;
 pub mod config;
 pub mod discover;
 pub mod env;
-mod fsutil;
+pub mod fsutil;
 pub mod identity;
 pub mod journal;
 pub mod keychain;
