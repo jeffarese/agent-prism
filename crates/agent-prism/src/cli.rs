@@ -238,10 +238,11 @@ Usage:
   agp pick [--json] [--codex] [--n <k>]
                                       the account a new session would use; --n: the
                                       next k runs, each counting the ones before
-  agp learn [<path>] [--all] [--json]
+  agp learn [<path>] [--prompt <text>] [--all] [--json]
                                       burn of past sessions in this repository
-                                      by kind of task and effort; --all: every
-                                      repository
+                                      by kind of task and effort, and what a
+                                      new run (with this prompt) counts as in
+                                      picks; --all: every repository
   agp settings                      settings (full screen)
   agp dashboard [--port <n>] [--no-open] [--allow-host <name>]
                                       usage dashboard in the browser
@@ -470,12 +471,19 @@ pub fn parse(args: &[OsString]) -> Result<Command> {
         }
         "learn" => {
             let mut opts = crate::learn::LearnOpts::default();
-            for a in rest() {
+            let mut it = rest().into_iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--all" => opts.all = true,
                     "--json" => opts.json = true,
+                    "--prompt" => {
+                        opts.prompt = Some(
+                            it.next()
+                                .ok_or_else(|| anyhow::anyhow!("--prompt needs the prompt text"))?,
+                        )
+                    }
                     _ if !a.starts_with('-') && opts.path.is_none() => opts.path = Some(a),
-                    _ => bail!("usage: agp learn [<path>] [--all] [--json]"),
+                    _ => bail!("usage: agp learn [<path>] [--prompt <text>] [--all] [--json]"),
                 }
             }
             Command::Learn(opts)
@@ -747,6 +755,14 @@ mod tests {
                 path: Some("../app".into()),
                 all: false,
                 json: true,
+                prompt: None,
+            })
+        );
+        assert_eq!(
+            p(&["learn", "--prompt", "You are a lane runner"]),
+            Command::Learn(LearnOpts {
+                prompt: Some("You are a lane runner".into()),
+                ..Default::default()
             })
         );
         assert_eq!(

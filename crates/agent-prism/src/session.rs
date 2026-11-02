@@ -93,6 +93,9 @@ impl Drop for RunGuard {
 /// The launch entry point.
 pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
     let tool = args.tool;
+    // How heavy this run is, from past runs like it: its picks and its
+    // claim count it (DESIGN §11f).
+    crate::learn::learn_run_weight(&ctx.paths, tool, &args.tool_args, unix_now());
     // Before print mode and the nested-session check: a background launch
     // never runs in the wrapper, and an `AGP=1` env must not stop its
     // watcher.

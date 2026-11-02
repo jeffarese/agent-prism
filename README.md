@@ -154,10 +154,16 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
 - Moves on a limit are spread the same way.
 - `agp learn` shows how much past sessions in the current repository burned,
   by kind of task (solo, with agents, workflow) and by effort, read from
-  Claude Code's transcripts. agent-prism keeps these summaries (also after
-  Claude Code deletes old transcripts) and archives usage samples, so the
-  balancer can later weigh runs by repository and task. A launch refreshes
-  them in the background every 6 hours; nothing leaves the machine.
+  Claude Code's transcripts, and what a new run there counts as.
+  agent-prism keeps these summaries (also after Claude Code deletes old
+  transcripts) and refreshes them in the background every 6 hours; nothing
+  leaves the machine.
+- A run counts as more than one when past runs like it were heavy: runs in
+  the same repository with a similar first prompt (else the repository's
+  recent runs), up to 4x. A lane whose earlier copies burned 1.9x a typical
+  session claims 1.9 runs, so heavy lanes started together spread over more
+  accounts. The pick says why ("counts as 1.9 runs: 20 similar runs in
+  fathom"); `agp learn --prompt "<text>"` shows it before a launch.
 - `agp -p` gives each Claude run a session id. A resume (`--resume <id>`,
   `-c`, `codex exec resume`) starts on the account that last ran that
   conversation, where its prompt cache is, if it is not limited and has room.

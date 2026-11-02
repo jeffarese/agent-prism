@@ -112,6 +112,10 @@ pub fn run(ctx: &AppCtx, sid: &str) -> Result<i32> {
         log::warn!("bg {sid}: no record; nothing to watch");
         return Ok(0);
     };
+    // Its moves pick for a run of the weight learned at its launch.
+    if let Some(w) = rec.load {
+        crate::launch::set_run_weight(w, "learned at its launch".into());
+    }
     log::info!("bg {}: watching on {}", rec.short_id, rec.profile);
     record::update(&ctx.paths, sid, |r| {
         r.watcher_pid = Some(std::process::id());

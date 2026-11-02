@@ -32,10 +32,11 @@ agp pick --n 3 --codex --json | jq -r '.plan[] | "\(.label)\t\(.reason)"'
 - `capacity.claude` / `capacity.codex`: how many more runs the pool can
   take now before every account would reach its soft 5h mark
   (`balance.soft_5h`).
-- `agp learn --json`: how much past sessions in this repo burned, by kind
-  (`solo`, `1-4 agents`, `5+ agents`, `workflow`) and effort. `vs_typical`
-  above 2 means such lanes use the 5h window much faster than agp's default
-  assumes: plan fewer of them than `capacity`.
+- agp weighs each lane by past runs like it (same repo, similar first
+  prompt): a lane whose earlier copies burned 2x counts as 2 runs, so heavy
+  lanes spread on their own. `agp learn --prompt "<lane prompt>" --json`
+  shows the weight (`new_run`). `capacity` and `agp pick --n` count runs of
+  weight 1, so with heavy lanes (weight 2) plan about half of `capacity`.
 - `agp pick --n <k>`: one line per run, best first. Nothing is claimed, so
   the real lanes may land a bit differently. JSON:
   `{"chosen", "reason", "earliest_reset", "plan": [{"profile", "label", "reason"}]}`.

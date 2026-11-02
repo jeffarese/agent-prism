@@ -382,6 +382,7 @@ impl Wizard {
             stale_after_secs: 600,
             run_load: 0.0,
             prefer: None,
+            new_run: 1.0,
         };
         build_views(&inputs, &usage, &HashMap::new(), &vctx)
     }

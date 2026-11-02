@@ -355,6 +355,7 @@ impl SessionHost {
             // An idle session weighs less in picks (DESIGN §6.6).
             busy: self.busy || self.starting,
             pid_start: self.pid_start,
+            load: launch::claim_load(),
         };
         if let Err(e) = registry::write_record(&self.ctx.paths, &rec) {
             log::warn!("session registry: {e:#}");

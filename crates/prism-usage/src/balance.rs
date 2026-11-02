@@ -160,7 +160,7 @@ pub(crate) fn assess(
         let per_run = run_rate(input, ctx);
         let claimed = input.load * per_run;
         let burn = input.slope_5h.map_or(claimed, |s| s.max(claimed));
-        (u5h + burn * h, per_run * h)
+        (u5h + burn * h, per_run * h * ctx.new_run.max(0.0))
     } else {
         (u5h, 0.0)
     };
@@ -380,7 +380,7 @@ pub fn plan(
             break;
         };
         if let Some(i) = inputs.iter_mut().find(|i| i.profile_id == id) {
-            i.load += 1.0;
+            i.load += ctx.new_run.max(0.0);
             i.sessions_elsewhere += 1;
             i.last_used = Some(ctx.now);
         }
@@ -713,6 +713,17 @@ mod tests {
         p.iter()
             .map(|p| p.chosen.as_deref().unwrap_or("-"))
             .collect()
+    }
+
+    #[test]
+    fn heavy_lanes_spread_wider() {
+        let (inputs, u, mut c) = lanes();
+        // Lanes learned to burn 2x a typical run: three go to three accounts
+        // (with weight 1 they go a, b, a).
+        c.new_run = 2.0;
+        let p = plan(&inputs, &u, &c, 3);
+        assert_eq!(ids(&p), ["a", "b", "c"]);
+        assert_eq!(p[0].reason, "most 5h room (40% left with this run)");
     }
 
     #[test]

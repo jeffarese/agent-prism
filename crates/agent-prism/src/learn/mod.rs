@@ -7,8 +7,10 @@
 //! the transcript (after 30 days by default). It also archives the accounts'
 //! usage samples (the usage cache keeps 7 days) and their plans. Launches
 //! start a harvest in the background at most every [`EVERY_SECS`]. Nothing
-//! leaves the machine, and the balancer does not use any of it yet.
+//! leaves the machine. At launch, [`learn_run_weight`] sets how many typical
+//! runs the new run counts as ([`estimate`]), for its pick and its claim.
 
+pub mod estimate;
 pub mod report;
 mod scan;
 pub mod store;
@@ -46,6 +48,8 @@ pub struct LearnOpts {
     /// One line per repository.
     pub all: bool,
     pub json: bool,
+    /// Show the weight a run with this prompt gets.
+    pub prompt: Option<String>,
 }
 
 /// `<state>/learn/state.json`.
@@ -212,6 +216,22 @@ fn account_infos(ctx: &AppCtx, profiles: &[Profile]) -> BTreeMap<String, store::
         .collect()
 }
 
+/// At launch: sets this process's run weight from the store (Claude runs;
+/// nothing when the store knows too little). Never fails a launch.
+pub fn learn_run_weight(paths: &Paths, tool: Tool, args: &[String], now: i64) {
+    if tool != Tool::Claude {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let prompt = launch::prompt_of(args);
+    if let Some(e) = estimate::estimate(paths, &cwd, prompt.as_deref(), now) {
+        log::info!("learned weight {:.1}: {}", e.weight, e.why);
+        launch::set_run_weight(e.weight, e.why);
+    }
+}
+
 /// `agp learn [<path>] [--all] [--json]`: brings the store up to date, then
 /// shows the repository of `path` (or every repository).
 pub fn run(ctx: &AppCtx, opts: LearnOpts) -> Result<i32> {
@@ -252,7 +272,15 @@ pub fn run(ctx: &AppCtx, opts: LearnOpts) -> Result<i32> {
     };
     let path = path.canonicalize().unwrap_or(path);
     let repo = store::repo_root(&path).to_string_lossy().into_owned();
-    let r = report::repo_report(&all, &repo, &labels, LATEST);
+    let mut r = report::repo_report(&all, &repo, &labels, LATEST);
+    r.new_run =
+        estimate::estimate(&ctx.paths, &path, opts.prompt.as_deref(), unix_now()).map(|e| {
+            report::NewRun {
+                weight: e.weight,
+                why: e.why,
+                prompt: opts.prompt.clone(),
+            }
+        });
     if opts.json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {

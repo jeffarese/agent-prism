@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -222,6 +222,53 @@ pub fn has_session_flag(args: &[String]) -> bool {
 pub fn has_prompt(args: &[String]) -> bool {
     let opts = options(args);
     parts(opts).iter().any(|p| !p.flag) || args.len() > opts.len() + 1
+}
+
+/// The prompt in the claude args: the positionals among the options and
+/// everything after `--`, joined with spaces. `None` without one.
+pub fn prompt_of(args: &[String]) -> Option<String> {
+    let opts = options(args);
+    let mut words: Vec<&str> = parts(opts)
+        .iter()
+        .filter(|p| !p.flag)
+        .flat_map(|p| opts[p.start..p.end].iter().map(String::as_str))
+        .collect();
+    words.extend(args.iter().skip(opts.len() + 1).map(String::as_str));
+    let text = words.join(" ");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// This process's run as learned from past runs (DESIGN §6.6, §11f): how
+/// many typical runs it counts as and why. One agent-prism process runs
+/// one run, so it is set once at launch (or by a watcher from its
+/// session's record) and every pick and claim of the process uses it.
+static RUN_WEIGHT: OnceLock<(f64, String)> = OnceLock::new();
+
+/// Sets the run's weight (once; later calls are ignored).
+pub fn set_run_weight(weight: f64, why: String) {
+    if weight.is_finite() && weight > 0.0 {
+        let _ = RUN_WEIGHT.set((weight, why));
+    }
+}
+
+/// How many typical runs this process's run counts as (1 when unknown).
+pub fn run_weight() -> f64 {
+    RUN_WEIGHT.get().map_or(1.0, |w| w.0)
+}
+
+/// The weight to write in a claim: only one above 1.
+pub fn claim_load() -> Option<f64> {
+    let w = run_weight();
+    (w > 1.0).then_some(w)
+}
+
+/// The note the pick reason gets for a heavy run.
+fn run_weight_note() -> Option<String> {
+    RUN_WEIGHT.get().and_then(|(w, why)| weight_note(*w, why))
+}
+
+fn weight_note(weight: f64, why: &str) -> Option<String> {
+    (weight > 1.0).then(|| format!("counts as {weight:.1} runs: {why}"))
 }
 
 /// The parts of `args` without the session flags (and their values).
@@ -838,8 +885,8 @@ pub fn touch_last_used(paths: &Paths, id: &str, now: i64) {
 pub fn run_loads(paths: &Paths, now: i64) -> HashMap<String, registry::Load> {
     let live = registry::list_live(paths);
     let mut loads = registry::loads(&live, std::process::id());
-    for profile in crate::bg::running(paths, now) {
-        loads.entry(profile).or_default().add(1.0);
+    for (profile, weight) in crate::bg::running(paths, now) {
+        loads.entry(profile).or_default().add(weight);
     }
     loads
 }
@@ -941,6 +988,7 @@ pub fn view_ctx(
         stale_after_secs: 2 * config.usage.poll_idle_secs as i64,
         run_load: config.balance.run_load.max(0.0),
         prefer: None,
+        new_run: run_weight(),
     }
 }
 
@@ -1121,7 +1169,12 @@ fn take_snapshot(
     let usage = load_usage(&app.cache, profiles);
     let mut ctx = view_ctx(config, policy, model, None, now);
     ctx.prefer = prefer;
-    let pick = balance::pick(&inputs, &usage, &ctx);
+    let mut pick = balance::pick(&inputs, &usage, &ctx);
+    if pick.chosen.is_some()
+        && let Some(note) = run_weight_note()
+    {
+        pick.reason = format!("{} · {note}", pick.reason);
+    }
     Snapshot {
         inputs,
         usage,
@@ -1152,6 +1205,7 @@ pub fn claim_record(
         mode,
         busy,
         pid_start: registry::process_start(pid),
+        load: claim_load(),
     }
 }
 
@@ -1185,6 +1239,31 @@ mod tests {
     /// Values are read the way Claude reads them: `--effort high` has no
     /// prompt, a list flag takes every word up to the next flag, and an
     /// optional value is never a flag.
+    #[test]
+    fn prompt_of_args() {
+        assert_eq!(
+            prompt_of(&v(&[
+                "--effort",
+                "high",
+                "You are a lane runner",
+                "--verbose"
+            ]))
+            .as_deref(),
+            Some("You are a lane runner")
+        );
+        assert_eq!(
+            prompt_of(&v(&["-p", "--model", "opus", "--", "fix", "it"])).as_deref(),
+            Some("fix it")
+        );
+        assert_eq!(prompt_of(&v(&["--resume", "abc", "--effort", "max"])), None);
+        assert_eq!(prompt_of(&v(&[])), None);
+        assert_eq!(
+            weight_note(1.9, "14 similar runs in fathom").as_deref(),
+            Some("counts as 1.9 runs: 14 similar runs in fathom")
+        );
+        assert_eq!(weight_note(1.0, "x"), None);
+    }
+
     #[test]
     fn values_are_not_prompts() {
         assert!(!has_prompt(&v(&["--effort", "high"])));

@@ -431,6 +431,19 @@ now belongs to a process that started at another time (a reused pid), is
 deleted when the registry is read. Records of older versions read as busy
 interactive Claude sessions.
 
+**Learned weight.** A Claude launch first estimates how many typical runs
+it counts as, `w` (§11f: similar past runs in the same repository, else
+the repository's recent runs; from 1 to 4; 1 when the store knows too
+little). The claim stores it as `load` (only above 1) and a working run's
+weight above is `load` instead of 1 (idle stays 0.25). A `--bg` launch
+writes it to the background record (`load`, §11d), which `running` counts
+the same way. The value holds for the process's whole run: its limit
+switches and supervised moves, and the watcher's and `agp bg move`'s moves
+(from the record), place it with the same `w`. A pick for a heavy run says
+why: "most 5h room (40% left with this run) · counts as 1.9 runs: 20
+similar runs in fathom". `agp pick --n` and `capacity` plan runs of weight
+1 (they know no prompt).
+
 **Pick lock.** A pick that writes a claim holds the exclusive `flock` on
 `<state>/pick.lock` from reading the claims to writing its own (5 s wait;
 on timeout it picks without the lock, a launch never fails for it). The
@@ -444,7 +457,7 @@ this plan, `%/h`):
 
 ```
 load_5h  = u5h + max(burn_rate, Σ weights of the other runs × r) × h
-with_run = load_5h + r × h        (this run added)
+with_run = load_5h + w × r × h    (this run added, w its learned weight)
 ```
 
 `balance.run_load` (default 25, 0 turns all of this off) is 25% of a 5h
@@ -454,9 +467,8 @@ sessions average ~5%/h (mostly idle: 0.25 × 25 ≈ 6), a session's first hour
 ~14%/h (about 40% of it working). A per-account rate learned from the
 journal was tried and left out: the journal has no busy time, so it measures
 open sessions, not working runs, and would undercount lanes; the burn-rate
-term already adapts to what an account really uses. Per-session burn read from
-the transcripts is collected (§11f) for a later per-repository estimate;
-the balancer does not use it yet.
+term already adapts to what an account really uses. Per-session burn read
+from the transcripts (§11f) gives each new run its weight `w` instead.
 
 - **Limited**: `u5h >= hard`, or `u7d >= 100 - reserve_7d`, or a scoped
   window for the session's model `>= hard`. Limited accounts are never
@@ -1096,7 +1108,8 @@ the current profile (where the stopped old jobs are). `watching`: a
 watcher holds the lock now. Extra keys: `created_at`, `wait_until`,
 `note` (the last thing that happened), `options` (the watch's per-run
 options), `run` (journal run id), `launch` (`user_settings`, `key`,
-`added`: what agent-prism launched with), `limit_key`. A launch with
+`added`: what agent-prism launched with), `limit_key`, `load` (the
+learned weight of the launch, §6.6; absent: 1). A launch with
 on-limit `stay` writes the record too (no watcher, `watching: false`). A
 record nobody watches whose job folder is gone becomes `ended` when
 listed; records (and settings files) of sessions that ended a week ago
@@ -1189,10 +1202,27 @@ alone (skipped).
 ## 11f. Learning (`agp learn`)
 
 Code: `crates/agent-prism/src/learn/` (`scan.rs` reads transcripts,
-`store.rs` the store, `report.rs` the output). The goal: know how heavy a
-repository's kinds of task are, from past sessions, so that a later
-balancer can weigh a new run by its repository and task instead of the flat
-`run_load`, and keep the data to analyze it. Nothing leaves the machine.
+`store.rs` the store, `estimate.rs` a new run's weight, `report.rs` the
+output). The goal: know how heavy a repository's kinds of task are, from
+past sessions, so that the balancer weighs a new run by its repository and
+task instead of the flat `run_load` (§6.6), and keep the data to analyze
+it. Nothing leaves the machine.
+
+**A new run's weight** (`estimate.rs`, read from `sessions.jsonl` at every
+Claude launch, before the pick). Typical = the median burn
+over all stored sessions. The repository's runs of the last 90 days with 3+
+working minutes count. The prompt (the claude args' positionals and
+everything after `--`) and each past first prompt become sets of lowercase
+words of 2+ letters or digits from their first 200 characters; past runs
+whose sets share at least half of all their words (Jaccard ≥ 0.5) are
+similar. With 3 or more similar runs (the 20 most similar, newest among
+equals), the run's rate is their p75 ("20 similar runs in fathom"); else,
+with 5 or more runs in the repository, the median of the newest 50 ("50
+recent runs in fathom"); else no estimate. Weight = rate / typical, clamped
+to 1–4 and rounded to 0.1: a run never counts as less than one (an
+underestimate costs a move, which stops background work; an overestimate
+only spreads runs more). Checked on the m2max store (2026-11-02): fathom
+lane runners 1.9, any other fathom run 1.8, tri and garmin-watchfaces 1.
 
 **Harvest.** Reads every Claude session under the `projects/` folders (the
 common home's and each Claude profile's, once each after `canonicalize`)
@@ -1256,15 +1286,16 @@ needs the archived samples and the accounts' plans (a later step).
 `1-4 agents`, `solo`. Burn = kU per working hour, for sessions with 3+
 working minutes.
 
-**`agp learn [<path>] [--all] [--json]`**: harvests, then shows the
-repository of `path` (default: the current folder, through `repo_root`):
-the sessions, their date range, the median burn over all repositories
+**`agp learn [<path>] [--prompt <text>] [--all] [--json]`**: harvests, then
+shows the repository of `path` (default: the current folder, through
+`repo_root`): the weight a new run there gets (with `--prompt`: a run with
+that prompt) and why, the sessions, their date range, the median burn over all repositories
 ("typical"), a table by kind and by effort (sessions, median, p75, p90 by
 nearest rank, median × typical, median working time) and the latest 12
 sessions (start, kind, effort, working time, burn, accounts and limits from
 the journal, title or prompt). `--all`: one line per repository, most
-sessions first. `--json`: the same data (`RepoReport` or a list of
-`RepoLine`). `learn` is a reserved word like `status` (with `-p` the line
+sessions first. `--json`: the same data (`RepoReport`, with `new_run`
+`{weight, why, prompt}` or null, or a list of `RepoLine`). `learn` is a reserved word like `status` (with `-p` the line
 goes to claude).
 
 ## 12. Codex (ChatGPT plans)

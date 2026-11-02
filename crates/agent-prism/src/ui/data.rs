@@ -40,6 +40,7 @@ fn view_ctx(config: &Config) -> ViewCtx {
         stale_after_secs: (config.usage.poll_idle_secs as i64) * 2,
         run_load: config.balance.run_load.max(0.0),
         prefer: None,
+        new_run: 1.0,
     }
 }
 

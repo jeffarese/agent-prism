@@ -57,6 +57,9 @@ pub struct ViewCtx {
     /// Start on this account when it is usable and has room (a resume on
     /// the account that last ran the session).
     pub prefer: Option<String>,
+    /// How many typical runs the run being placed counts as: 1, or what
+    /// agent-prism learned from past runs like it (DESIGN §11f).
+    pub new_run: f64,
 }
 
 fn status(cached: Option<&CachedUsage>, ctx: &ViewCtx) -> UsageStatus {
@@ -182,6 +185,7 @@ pub(crate) mod tests {
             stale_after_secs: 600,
             run_load: 0.0,
             prefer: None,
+            new_run: 1.0,
         }
     }
 

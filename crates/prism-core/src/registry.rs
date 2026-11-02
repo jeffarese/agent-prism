@@ -53,15 +53,19 @@ pub struct SessionRecord {
     /// not keep a claim alive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start: Option<i64>,
+    /// How many typical runs this one counts as while it works, learned
+    /// from past runs like it (DESIGN §11f); none: one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<f64>,
 }
 
 impl SessionRecord {
-    /// The balancer weight of this run: 1 while it works, less for an
-    /// interactive session that waits for its user.
+    /// The balancer weight of this run: 1 (or its learned `load`) while it
+    /// works, less for an interactive session that waits for its user.
     pub fn weight(&self) -> f64 {
         match (self.tool, self.mode, self.busy) {
             (Tool::Codex, RunMode::Tui, _) => CODEX_TUI_WEIGHT,
-            (_, _, true) => 1.0,
+            (_, _, true) => self.load.filter(|w| *w > 0.0).unwrap_or(1.0),
             (_, _, false) => IDLE_WEIGHT,
         }
     }
@@ -237,6 +241,7 @@ mod tests {
             mode: RunMode::Tui,
             busy: true,
             pid_start: None,
+            load: None,
         }
     }
 
@@ -305,6 +310,19 @@ mod tests {
         assert_eq!(codex.weight(), CODEX_TUI_WEIGHT);
         codex.mode = RunMode::Exec;
         assert_eq!(codex.weight(), 1.0);
+        // A learned load counts while the run works; idle stays a quarter.
+        let mut heavy = rec(6);
+        heavy.load = Some(1.9);
+        assert_eq!(heavy.weight(), 1.9);
+        heavy.busy = false;
+        assert_eq!(heavy.weight(), IDLE_WEIGHT);
+        // Records of older versions have no load.
+        let old: SessionRecord = serde_json::from_str(
+            r#"{"pid":1,"profile":"a","session_id":null,"cwd":"/","started_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.load, None);
+        assert_eq!(old.weight(), 1.0);
     }
 
     #[test]

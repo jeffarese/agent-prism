@@ -212,6 +212,10 @@ pub struct Record {
     pub launch: Option<Launch>,
     /// The `updatedAt` of the last limit handled (each is handled once).
     pub limit_key: Option<String>,
+    /// How many typical runs the session counts as while it works, learned
+    /// at its launch (DESIGN §11f); none: one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<f64>,
 }
 
 impl Record {

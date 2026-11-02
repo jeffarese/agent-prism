@@ -49,6 +49,17 @@ pub struct RepoReport {
     pub kinds: Vec<Group>,
     pub efforts: Vec<Group>,
     pub latest: Vec<Latest>,
+    /// How many typical runs a new run here counts as in a pick (with the
+    /// prompt given, if any), and why. `None`: too little data (1).
+    pub new_run: Option<NewRun>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NewRun {
+    pub weight: f64,
+    pub why: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -171,6 +182,7 @@ pub fn repo_report(
         kinds,
         efforts,
         latest,
+        new_run: None,
     }
 }
 
@@ -271,6 +283,20 @@ pub fn repo_text(r: &RepoReport) -> String {
         return out;
     }
     out.push_str(&format!("{name} ({})\n", tilde(&r.repo)));
+    let what = match r.new_run.as_ref().and_then(|n| n.prompt.as_ref()) {
+        Some(_) => "A new run with this prompt",
+        None => "A new run here",
+    };
+    match &r.new_run {
+        Some(n) if n.weight > 1.0 => out.push_str(&format!(
+            "{what} counts as {:.1} runs in agp's picks ({}).\n",
+            n.weight, n.why
+        )),
+        Some(n) => out.push_str(&format!("{what} counts as 1 run ({}).\n", n.why)),
+        None => out.push_str(&format!(
+            "{what} counts as 1 run (too few past runs to tell).\n"
+        )),
+    }
     out.push_str(&format!(
         "{} sessions from {} to {}, {} with 3+ working minutes. Typical over all repositories: {}.\n\n",
         r.sessions,

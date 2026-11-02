@@ -153,11 +153,11 @@ impl Drop for LaunchClaim<'_> {
 /// A launched job counts as running this long before its state is known.
 const JUST_LAUNCHED_SECS: i64 = 120;
 
-/// The profile of every background session agp knows that uses its
-/// account now: a watched (or `stay`) session whose job is working, or that
-/// was launched moments ago. Sessions agp is moving are counted by the
+/// The profile and weight of every background session agp knows that uses
+/// its account now: a watched (or `stay`) session whose job is working, or
+/// that was launched moments ago. Sessions agp is moving are counted by the
 /// mover's claim. Read-only, for the balancer (DESIGN §6.6).
-pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<String> {
+pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<(String, f64)> {
     let Ok(rd) = std::fs::read_dir(record::dir(paths)) else {
         return Vec::new();
     };
@@ -180,7 +180,8 @@ pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<String> {
                 Some(st) => st.state == "working",
                 None => now - r.created_at < JUST_LAUNCHED_SECS,
             };
-            working.then_some(r.profile)
+            let weight = r.load.filter(|w| *w > 0.0).unwrap_or(1.0);
+            working.then_some((r.profile, weight))
         })
         .collect()
 }
@@ -335,6 +336,7 @@ fn write_record(ctx: &AppCtx, req: &WatchReq) -> Result<Record> {
         r.options = req.options.clone();
         if req.launch.is_some() {
             r.launch = req.launch.clone();
+            r.load = crate::launch::claim_load();
         }
         if req.run.is_some() {
             r.run = req.run.clone();
@@ -467,6 +469,9 @@ fn move_cmd(ctx: &AppCtx, id: &str, to: Option<&str>, json: bool) -> Result<i32>
         .unwrap_or_default();
     let env = Env::load(ctx, &opts)?;
     let (from, short, rec) = locate(ctx, &env.profiles, id, None)?;
+    if let Some(w) = rec.as_ref().and_then(|r| r.load) {
+        crate::launch::set_run_weight(w, "learned at its launch".into());
+    }
     let job = job::read_state(&from.dir, &short)
         .with_context(|| format!("no readable state for {short} in {}", from.label))?;
     let sid = job
