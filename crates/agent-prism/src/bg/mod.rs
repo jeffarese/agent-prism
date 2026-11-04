@@ -179,11 +179,19 @@ pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<(String, f64)>
             let working = match job::read_state(&dir, &r.short_id) {
                 Some(st) => st.state == "working",
                 None => now - r.created_at < JUST_LAUNCHED_SECS,
-            };
+            } || background_work(&dir, &r, now);
             let weight = r.load.filter(|w| *w > 0.0).unwrap_or(1.0);
             working.then_some((r.profile, weight))
         })
         .collect()
+}
+
+/// Subagents or workflows of the session work on after its turn ended,
+/// since its launch or last move (DESIGN §6.6).
+fn background_work(config_dir: &std::path::Path, r: &record::Record, now: i64) -> bool {
+    let since = r.moves.last().map_or(r.created_at, |m| m.at);
+    prism_core::registry::find_transcript(&config_dir.join("projects"), &r.session_id)
+        .is_some_and(|t| prism_core::registry::background_active(&t, since, now))
 }
 
 /// The account of the background session `id` (a session or short id)
@@ -663,4 +671,46 @@ fn list(ctx: &AppCtx, json: bool) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod running_tests {
+    use super::*;
+
+    /// A background session whose job is idle while its workflow works on
+    /// counts, with its learned load; work from before its last move does not.
+    #[test]
+    fn idle_job_with_working_workflow_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = prism_core::paths::Paths::under(tmp.path());
+        let cfg = tmp.path().join("cfg");
+        let sid = "abcdef12-0000-0000-0000-000000000000";
+        let now = crate::launch::unix_now();
+        record::update(&paths, sid, |r| {
+            r.short_id = job::short_of(sid);
+            r.profile = "a".into();
+            r.config_dir = Some(cfg.to_string_lossy().into());
+            r.created_at = now - 3600;
+            r.load = Some(1.9);
+        })
+        .unwrap();
+        let state = job::state_file(&cfg, "abcdef12");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        std::fs::write(&state, r#"{"state":"idle"}"#).unwrap();
+        assert!(running(&paths, now).is_empty());
+        let t = cfg.join(format!("projects/-w/{sid}.jsonl"));
+        let agent = prism_core::registry::subagents_dir(&t).join("workflows/wf/agent-a.jsonl");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&t, "").unwrap();
+        std::fs::write(&agent, "{}\n").unwrap();
+        assert_eq!(running(&paths, now), vec![("a".to_string(), 1.9)]);
+        record::update(&paths, sid, |r| {
+            r.moves.push(record::Move {
+                at: now + 5,
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        assert!(running(&paths, now + 10).is_empty());
+    }
 }

@@ -884,7 +884,7 @@ pub fn touch_last_used(paths: &Paths, id: &str, now: i64) {
 /// claims in the run registry, plus background sessions whose job works.
 pub fn run_loads(paths: &Paths, now: i64) -> HashMap<String, registry::Load> {
     let live = registry::list_live(paths);
-    let mut loads = registry::loads(&live, std::process::id());
+    let mut loads = registry::loads(&live, std::process::id(), now);
     for (profile, weight) in crate::bg::running(paths, now) {
         loads.entry(profile).or_default().add(weight);
     }
@@ -1206,6 +1206,7 @@ pub fn claim_record(
         busy,
         pid_start: registry::process_start(pid),
         load: claim_load(),
+        transcript: None,
     }
 }
 

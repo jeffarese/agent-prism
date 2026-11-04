@@ -413,18 +413,30 @@ and each account's 5h burn rate (§6.5).
 
 **Claims.** Every run agent-prism starts holds a record in the run registry
 `<state>/sessions/<pid>.json` (`SessionRecord`: profile, tool, mode, busy,
-session id, cwd, the pid's start time) while it runs, in every mode:
+session id, cwd, transcript, the pid's start time) while it runs, in every
+mode:
 
 | Run | Claim | Weight |
 | --- | --- | --- |
-| interactive `agp` (Claude) | written at the pick, kept by the host, removed at exit | 1 while a turn runs (`UserPromptSubmit` → `Stop`, or started with a prompt), else 0.25 |
+| interactive `agp` (Claude) | written at the pick, kept by the host, removed at exit | 1 while it works (below), else 0.25 |
 | interactive `agp codex` | the same | 0.5 (no hooks tell whether it works) |
 | `agp -p`, `agp codex exec` (exec'd) | written before `exec`; the tool keeps the pid | 1 |
 | supervised print (`--on-limit`) | written at the pick, moved with the run, removed at the end | 1 |
 | `agp --bg` launch | from the pick until the session's record exists | 1 |
-| watched background session | none: derived from `<state>/bg` (state `watching`, job `working`, or launched < 2 min ago) | 1 |
+| watched background session | none: derived from `<state>/bg` (state `watching`, and job `working`, launched < 2 min ago, or background work as below) | 1 |
 | background move | the watcher (or `agp bg move`) claims each target it tries, until the record says where the session runs | 1 |
 | limit switch countdown/question (interactive) | the host's claim names the target until the switch or a cancel | as above |
+
+An interactive Claude session works while a turn runs (`UserPromptSubmit`
+→ `Stop`, or started or restarted with a prompt) and while its background
+work runs: a turn can start subagents or a workflow and end while they go
+on, often burning more than the turn did. The session's subagent and
+workflow transcripts (`<transcript without .jsonl>/subagents/**`) grow as
+they work, so a write there since the process started or last moved, and
+within `BACKGROUND_SECS` (10 minutes, as a long tool call can pause the
+writes), counts the session as working. Readers derive this from the
+claim's `transcript` (from `SessionStart`), so it needs no hook. Writes from
+before a move don't count: that work died with the old process.
 
 Runs pinned with `--as` claim too. A record whose pid is gone, or whose pid
 now belongs to a process that started at another time (a reused pid), is
@@ -435,7 +447,8 @@ interactive Claude sessions.
 it counts as, `w` (§11f: similar past runs in the same repository, else
 the repository's recent runs; from 1 to 4; 1 when the store knows too
 little). The claim stores it as `load` (only above 1) and a working run's
-weight above is `load` instead of 1 (idle stays 0.25). A `--bg` launch
+weight above is `load` instead of 1 (idle stays 0.25; background work is
+working). A `--bg` launch
 writes it to the background record (`load`, §11d), which `running` counts
 the same way. The value holds for the process's whole run: its limit
 switches and supervised moves, and the watcher's and `agp bg move`'s moves
@@ -703,12 +716,16 @@ user ("Switch account now" in the menu, pick a target or "best").
    when Claude has work to carry on: a `StopFailure` stopped the turn, or the
    end of the transcript shows an open turn (an unanswered prompt, teammate
    message, notification or tool result, or a running tool) or an active
-   `/goal` (the latest `goal_status` attachment is neither met nor failed).
+   `/goal` (the latest `goal_status` attachment is neither met nor failed),
+   or background work runs (subagents or a workflow whose turn ended, §6.6:
+   the restart stops them, and without a prompt nothing restarts them).
    Claude Code restores the goal on `--resume`, but its Stop hook only acts
    when a turn ends; without a prompt the resumed session waits for input.
-   The prompt is a one-line note (account, limit, and that background tasks
-   and subagents of the old process have stopped), a blank line, then
-   `resume_prompt`. The transcript scan reads at most the last 64 MB.
+   The prompt is a one-line note (account, limit, and that background
+   tasks, subagents and workflows of the old process have stopped), a blank
+   line, then `resume_prompt`. A manual switch sends the same note when
+   background work runs. A restart with a prompt counts as working (§6.6)
+   until its first turn ends, so sessions that move together spread. The transcript scan reads at most the last 64 MB.
    Claude starts a resumed session on the default effort, so an effort the
    session chose in Claude since agent-prism launched it (the last
    `/effort` or `/model` picker output in the transcript, newer than the

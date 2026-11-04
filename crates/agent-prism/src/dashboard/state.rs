@@ -232,6 +232,7 @@ pub fn build(
                 "tool": r.tool.bin(),
                 "mode": r.mode,
                 "busy": r.busy,
+                "background": r.background(now),
             })
         })
         .collect();

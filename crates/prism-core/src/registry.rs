@@ -8,8 +8,8 @@
 //! accounts. Picks that write a claim hold the pick lock ([`PickLock`]).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ pub const IDLE_WEIGHT: f64 = 0.25;
 /// The weight of an interactive Codex session: agent-prism can't tell
 /// whether it works (Codex sends no hooks).
 pub const CODEX_TUI_WEIGHT: f64 = 0.5;
+/// How long after the last write to a session's subagent or workflow
+/// transcripts its background work counts as running. Agents append to
+/// their transcripts as they work; a long tool call can pause that.
+pub const BACKGROUND_SECS: i64 = 600;
 
 fn yes() -> bool {
     true
@@ -46,7 +50,8 @@ pub struct SessionRecord {
     #[serde(default)]
     pub mode: RunMode,
     /// Working on a turn now. An idle interactive session counts as
-    /// [`IDLE_WEIGHT`] of a run.
+    /// [`IDLE_WEIGHT`] of a run, unless its background work runs (see
+    /// [`SessionRecord::background`]).
     #[serde(default = "yes")]
     pub busy: bool,
     /// When the process started (unix seconds), so that a reused pid does
@@ -57,18 +62,90 @@ pub struct SessionRecord {
     /// from past runs like it (DESIGN §11f); none: one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load: Option<f64>,
+    /// The session's transcript (Claude's `transcript_path`), whose
+    /// sibling folder holds its subagent and workflow transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<PathBuf>,
 }
 
 impl SessionRecord {
+    /// Subagents or workflows of this session work in the background: a
+    /// turn that starts them can end while they run on.
+    pub fn background(&self, now: i64) -> bool {
+        let since = self.switched_at.unwrap_or(self.started_at);
+        self.transcript
+            .as_deref()
+            .is_some_and(|t| background_active(t, since, now))
+    }
+
+    /// Working on a turn or in the background.
+    pub fn working(&self, now: i64) -> bool {
+        self.busy || self.background(now)
+    }
+
     /// The balancer weight of this run: 1 (or its learned `load`) while it
     /// works, less for an interactive session that waits for its user.
-    pub fn weight(&self) -> f64 {
-        match (self.tool, self.mode, self.busy) {
-            (Tool::Codex, RunMode::Tui, _) => CODEX_TUI_WEIGHT,
-            (_, _, true) => self.load.filter(|w| *w > 0.0).unwrap_or(1.0),
-            (_, _, false) => IDLE_WEIGHT,
+    pub fn weight(&self, now: i64) -> f64 {
+        if (self.tool, self.mode) == (Tool::Codex, RunMode::Tui) {
+            return CODEX_TUI_WEIGHT;
+        }
+        if self.working(now) {
+            self.load.filter(|w| *w > 0.0).unwrap_or(1.0)
+        } else {
+            IDLE_WEIGHT
         }
     }
+}
+
+/// The folder of a session's subagent and workflow transcripts:
+/// `<transcript without .jsonl>/subagents`.
+pub fn subagents_dir(transcript: &Path) -> PathBuf {
+    transcript.with_extension("").join("subagents")
+}
+
+/// The newest write (unix seconds) to a file in the session's subagents
+/// folder (`agent-*.jsonl`, `workflows/<run>/agent-*.jsonl`, ...).
+pub fn subagent_activity(transcript: &Path) -> Option<i64> {
+    newest_mtime(&subagents_dir(transcript), 3)
+}
+
+fn newest_mtime(dir: &Path, depth: u32) -> Option<i64> {
+    let mut best = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        let t = if ft.is_dir() {
+            if depth == 0 {
+                continue;
+            }
+            newest_mtime(&e.path(), depth - 1)
+        } else {
+            e.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+        };
+        best = best.max(t);
+    }
+    best
+}
+
+/// The session's background work runs: a subagent or workflow transcript
+/// was written since `since` (work from before a restart died with the
+/// old process) and within [`BACKGROUND_SECS`] of `now`.
+pub fn background_active(transcript: &Path, since: i64, now: i64) -> bool {
+    subagent_activity(transcript).is_some_and(|t| t >= since.max(now - BACKGROUND_SECS))
+}
+
+/// The transcript of Claude session `session_id` under a `projects`
+/// folder (`<projects>/<project>/<id>.jsonl`), when one exists.
+pub fn find_transcript(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let file = format!("{session_id}.jsonl");
+    std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(&file))
+        .find(|p| p.exists())
 }
 
 /// The runs on one account.
@@ -89,10 +166,10 @@ impl Load {
 }
 
 /// The runs per profile id in `records`, without the process `skip`.
-pub fn loads(records: &[SessionRecord], skip: u32) -> HashMap<String, Load> {
+pub fn loads(records: &[SessionRecord], skip: u32, now: i64) -> HashMap<String, Load> {
     let mut out: HashMap<String, Load> = HashMap::new();
     for r in records.iter().filter(|r| r.pid != skip) {
-        out.entry(r.profile.clone()).or_default().add(r.weight());
+        out.entry(r.profile.clone()).or_default().add(r.weight(now));
     }
     out
 }
@@ -242,6 +319,7 @@ mod tests {
             busy: true,
             pid_start: None,
             load: None,
+            transcript: None,
         }
     }
 
@@ -296,7 +374,7 @@ mod tests {
         idle.busy = false;
         let mut b = rec(3);
         b.profile = "b".into();
-        let l = loads(&[rec(1), idle, b, rec(4)], 4);
+        let l = loads(&[rec(1), idle, b, rec(4)], 4, 0);
         assert_eq!(
             l["a"],
             Load {
@@ -307,22 +385,67 @@ mod tests {
         assert_eq!(l["b"].runs, 1);
         let mut codex = rec(5);
         codex.tool = Tool::Codex;
-        assert_eq!(codex.weight(), CODEX_TUI_WEIGHT);
+        assert_eq!(codex.weight(0), CODEX_TUI_WEIGHT);
         codex.mode = RunMode::Exec;
-        assert_eq!(codex.weight(), 1.0);
+        assert_eq!(codex.weight(0), 1.0);
         // A learned load counts while the run works; idle stays a quarter.
         let mut heavy = rec(6);
         heavy.load = Some(1.9);
-        assert_eq!(heavy.weight(), 1.9);
+        assert_eq!(heavy.weight(0), 1.9);
         heavy.busy = false;
-        assert_eq!(heavy.weight(), IDLE_WEIGHT);
+        assert_eq!(heavy.weight(0), IDLE_WEIGHT);
         // Records of older versions have no load.
         let old: SessionRecord = serde_json::from_str(
             r#"{"pid":1,"profile":"a","session_id":null,"cwd":"/","started_at":1}"#,
         )
         .unwrap();
         assert_eq!(old.load, None);
-        assert_eq!(old.weight(), 1.0);
+        assert_eq!(old.weight(0), 1.0);
+    }
+
+    fn touch(path: &Path, at: i64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(path).unwrap();
+        f.set_modified(UNIX_EPOCH + Duration::from_secs(at as u64))
+            .unwrap();
+    }
+
+    #[test]
+    fn background_work_keeps_the_weight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("proj/s1.jsonl");
+        touch(&transcript, 1_000);
+        let now = 10_000;
+        let mut lane = rec(7);
+        lane.busy = false;
+        lane.load = Some(1.9);
+        lane.started_at = 5_000;
+        lane.transcript = Some(transcript.clone());
+        // No subagents yet: an idle session.
+        assert!(!lane.background(now));
+        assert_eq!(lane.weight(now), IDLE_WEIGHT);
+        // A workflow agent wrote a minute ago: the turn ended, the work goes on.
+        let agent = tmp
+            .path()
+            .join("proj/s1/subagents/workflows/wf_1/agent-a.jsonl");
+        touch(&agent, now - 60);
+        assert_eq!(subagent_activity(&transcript), Some(now - 60));
+        assert!(lane.background(now) && lane.working(now));
+        assert_eq!(lane.weight(now), 1.9);
+        assert_eq!(loads(&[lane.clone()], 0, now)["a"].weight, 1.9);
+        // Quiet for longer than BACKGROUND_SECS: done.
+        assert!(!lane.background(now + BACKGROUND_SECS + 61));
+        // Work from before a move died with the old process.
+        lane.switched_at = Some(now - 30);
+        assert!(!lane.background(now));
+        // A plain subagent counts too.
+        touch(
+            &tmp.path().join("proj/s1/subagents/agent-b.jsonl"),
+            now - 10,
+        );
+        assert!(lane.background(now));
+        assert_eq!(find_transcript(tmp.path(), "s1"), Some(transcript));
+        assert_eq!(find_transcript(tmp.path(), "s2"), None);
     }
 
     #[test]

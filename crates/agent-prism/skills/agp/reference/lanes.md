@@ -15,7 +15,9 @@ interactive `agp` / `agp codex` in a terminal pane.
   measured usage and the account's burn rate over the last hour. The
   default is `balance.run_load = 25`: 25% of a 5h window per working
   run-hour on a plan of capacity 1.0 (Max 5x, team), half that on 20x. An
-  interactive session waiting for its user counts a quarter.
+  interactive session waiting for its user counts a quarter. A session
+  whose turn ended while its subagents or a workflow work on counts in
+  full: agp sees their transcripts grow.
 - Moves on a limit are spread the same way, so lanes that hit limits
   together don't all land on one account.
 

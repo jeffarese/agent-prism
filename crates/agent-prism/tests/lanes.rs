@@ -285,3 +285,61 @@ fn print_runs_get_a_session_and_resumes_go_back() {
     assert!(s.cmd(&["-p", "lane-4"]).status().unwrap().success());
     assert_eq!(s.runs()[0].0, "a");
 }
+
+/// Two interactive lanes on a whose turns ended (`busy: false`) while the
+/// workflows they started work on: they count in full, not as idle
+/// sessions, so the next run goes elsewhere. Without the workflows' writes
+/// they are idle and a takes it.
+#[test]
+fn lanes_whose_workflows_work_count_in_full() {
+    let s = Setup::new();
+    let projects = s.root.join("home/.claude/projects/-work");
+    std::fs::create_dir_all(&projects).unwrap();
+    let mut sleepers = Vec::new();
+    for lane in ["l1", "l2"] {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let rec = serde_json::json!({
+            "pid": child.id(),
+            "profile": "a",
+            "session_id": lane,
+            "cwd": s.root.join("work"),
+            "started_at": now() - 600,
+            "tool": "claude",
+            "mode": "tui",
+            "busy": false,
+            "load": 1.9,
+            "transcript": projects.join(format!("{lane}.jsonl")),
+        });
+        std::fs::create_dir_all(s.root.join("state/sessions")).unwrap();
+        std::fs::write(
+            s.root.join(format!("state/sessions/{}.json", child.id())),
+            rec.to_string(),
+        )
+        .unwrap();
+        sleepers.push(child);
+    }
+    // Idle: a at 10% + 2 x 0.25 x 25 + 25 is under b's 30% + 25.
+    assert_eq!(s.json(&["pick", "--json"])["chosen"], "a");
+    for lane in ["l1", "l2"] {
+        let agent = projects.join(format!("{lane}/subagents/workflows/wf_1/agent-x.jsonl"));
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "{}\n").unwrap();
+    }
+    // Working: a at 10% + 2 x 1.9 x 25 + 25 is past the soft mark.
+    let pick = s.json(&["pick", "--json"]);
+    assert_eq!(pick["chosen"], "b", "{pick}");
+    let status = s.json(&["status", "--json"]);
+    let a = status["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["profile_id"] == "a")
+        .unwrap()
+        .clone();
+    assert_eq!(a["runs"], 2);
+    assert_eq!(a["load_5h"], 100.0, "{a}");
+    for mut c in sleepers {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}

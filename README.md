@@ -146,7 +146,8 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
   window per hour on a 5x/team plan (half that on 20x), on top of the
   account's measured use and its burn rate over the last hour (which also
   sees use from claude.ai or another machine). An interactive session that
-  waits for you counts a quarter. With accounts at 10%, 30% and 40%, three
+  waits for you counts a quarter, unless its subagents or a workflow it
+  started still work in the background. With accounts at 10%, 30% and 40%, three
   lanes go a, b, a instead of a, a, a.
 - `agp status --json` has `runs`, `load_5h` (expected 5h use one hour from
   now) and `usable` per account, and `capacity`: how many more runs fit

@@ -356,6 +356,7 @@ impl SessionHost {
             busy: self.busy || self.starting,
             pid_start: self.pid_start,
             load: launch::claim_load(),
+            transcript: self.transcript.clone(),
         };
         if let Err(e) = registry::write_record(&self.ctx.paths, &rec) {
             log::warn!("session registry: {e:#}");
@@ -607,6 +608,8 @@ impl SessionHost {
                 ctl.restart_child(spec);
                 self.restart_codex_watch(now);
                 self.busy = false;
+                self.starting = true;
+                self.write_registry();
                 self.set_message(MessageLevel::Info, format!("{label} reset · going on"));
             }
             Err(e) => self.set_message(MessageLevel::Error, format!("resume failed: {e:#}")),
@@ -636,10 +639,11 @@ impl SessionHost {
     /// notification or a `/goal` Stop hook starts fire no
     /// `UserPromptSubmit`, so `busy` and `interrupted` miss them; the
     /// transcript shows them. A restored `/goal` acts only when a turn
-    /// ends, so it needs a prompt too.
+    /// ends, so it needs a prompt too. Subagents and workflows that work in
+    /// the background after their turn ended die with the old process, so
+    /// they need one as well.
     fn limit_prompt(&self, p: &Pending) -> Option<String> {
-        let resume = &self.config.balance.resume_prompt;
-        if resume.is_empty() {
+        if self.config.balance.resume_prompt.is_empty() {
             return None;
         }
         if !p.interrupted {
@@ -648,12 +652,13 @@ impl SessionHost {
                 .as_deref()
                 .map(crate::transcript::inspect)
                 .unwrap_or_default();
+            let background = self.background_active();
             log::info!(
-                "transcript at switch: goal {}, open turn {}",
+                "transcript at switch: goal {}, open turn {}, background {background}",
                 tail.goal,
                 tail.open_turn
             );
-            if !tail.goal && !tail.open_turn {
+            if !tail.goal && !tail.open_turn && !background {
                 return None;
             }
         }
@@ -665,14 +670,45 @@ impl SessionHost {
                 self.label(&p.target)
             )
         };
-        Some(format!(
-            "[agent-prism] Account {} {}, so {moved} \
-             and `{}` restarted. Background tasks and subagents that ran in the old \
-             process have stopped; start again the ones you still need.\n\n{resume}",
+        Some(self.restart_prompt(&format!(
+            "Account {} {}, so {moved}",
             self.label(&self.active),
-            p.reason,
+            p.reason
+        )))
+    }
+
+    /// The first prompt after a move by hand to `target`: only when
+    /// subagents or workflows work in the background, which the restart
+    /// stops.
+    fn manual_prompt(&self, target: &str) -> Option<String> {
+        if self.config.balance.resume_prompt.is_empty() || !self.background_active() {
+            return None;
+        }
+        log::info!("background work at a move by hand");
+        Some(self.restart_prompt(&format!(
+            "This conversation moved by hand from account {} to account {}",
+            self.label(&self.active),
+            self.label(target)
+        )))
+    }
+
+    fn restart_prompt(&self, what: &str) -> String {
+        format!(
+            "[agent-prism] {what} and `{}` restarted. Background tasks, subagents and \
+             workflows that ran in the old process have stopped; start again the ones \
+             you still need.\n\n{}",
             self.tool.bin(),
-        ))
+            self.config.balance.resume_prompt
+        )
+    }
+
+    /// Subagents or workflows of this session wrote their transcripts
+    /// lately, in this process (DESIGN §6.6).
+    fn background_active(&self) -> bool {
+        let now = self.now();
+        self.transcript
+            .as_deref()
+            .is_some_and(|t| registry::background_active(t, self.since, now))
     }
 
     /// Moves the session to `target` (§9 steps 4–5), with `prompt` as the
@@ -719,6 +755,9 @@ impl SessionHost {
             self.set_message(MessageLevel::Error, format!("unknown profile {target}"));
             return false;
         };
+        // A prompt starts a turn: the claim counts as working until it ends,
+        // so that runs that move together still spread.
+        let resumes = prompt.is_some();
         let start = Start::Resume {
             session_id: sid.clone(),
             prompt,
@@ -745,6 +784,7 @@ impl SessionHost {
         });
         self.since = now;
         self.busy = false;
+        self.starting = resumes;
         // The new account is not limited; a later limit is a new episode.
         self.limit_episode = false;
         self.write_registry();
@@ -1028,7 +1068,8 @@ impl SessionHost {
                 };
                 match target {
                     Some(t) => {
-                        self.perform_switch(&t, None, ctl);
+                        let prompt = self.manual_prompt(&t);
+                        self.perform_switch(&t, prompt, ctl);
                     }
                     None => self.set_message(MessageLevel::Error, "No other account to switch to"),
                 }
@@ -1526,6 +1567,83 @@ mod tests {
         assert!(!f.host.busy);
         let a = polled_switch_args(&mut f);
         assert!(a[a.len() - 1].starts_with("[agent-prism] Account Acct A"));
+    }
+
+    /// Writes a workflow agent's transcript for the session at `t`, as an
+    /// agent that works does.
+    fn workflow_agent_writes(t: &std::path::Path) {
+        let agent = registry::subagents_dir(t).join("workflows/wf_1/agent-a.jsonl");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "{}\n").unwrap();
+    }
+
+    /// A lane starts a workflow and its turn ends while the agents work on:
+    /// the claim counts it as working, and a limit switch (which stops the
+    /// agents) sends the prompt and keeps the claim working on the target.
+    #[test]
+    fn background_workflow_counts_and_gets_a_prompt() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        let t = start_with_transcript(&mut f, &finished_turn());
+        let paths = f.host.ctx.paths.clone();
+        let pid = std::process::id();
+        hook(&mut f.host, "UserPromptSubmit", serde_json::json!({}));
+        hook(&mut f.host, "Stop", serde_json::json!({}));
+        let now = unix_now();
+        let rec = registry::read_record(&paths, pid).expect("claim");
+        assert_eq!(rec.transcript.as_deref(), Some(t.as_path()));
+        assert!(
+            !rec.busy && !rec.working(now),
+            "idle, nothing in the background"
+        );
+        workflow_agent_writes(&t);
+        let rec = registry::read_record(&paths, pid).unwrap();
+        assert!(!rec.busy && rec.working(now), "the workflow works");
+        let a = polled_switch_args(&mut f);
+        assert_eq!(a[a.len() - 3..a.len() - 1], ["--resume", "sess-1"]);
+        let prompt = &a[a.len() - 1];
+        assert!(
+            prompt.contains("workflows that ran in the old process have stopped"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("\n\ncontinue"), "{prompt}");
+        let rec = registry::read_record(&paths, pid).unwrap();
+        assert_eq!(rec.profile, "b");
+        assert!(rec.busy, "the resumed turn counts until it ends");
+        // The agents' writes from before the move don't count on b.
+        hook(&mut f.host, "Stop", serde_json::json!({}));
+        let rec = registry::read_record(&paths, pid).unwrap();
+        let moved = rec.switched_at.expect("switched");
+        assert!(!rec.busy && !rec.working(moved));
+        registry::remove_record(&paths, pid);
+    }
+
+    /// A move by hand stops background work too: it sends the note then,
+    /// and nothing otherwise.
+    #[test]
+    fn manual_switch_prompts_only_for_background_work() {
+        let mut f = fixture(10.0, 5.0, true, OnLimit::Auto);
+        start_with_transcript(&mut f, &finished_turn());
+        let mut ctl = Control::default();
+        f.host
+            .on_action(UiAction::SwitchTo(Some("b".into())), &mut ctl);
+        let a = args(&ctl.take_restart().expect("restart"));
+        assert_eq!(a[a.len() - 2..], ["--resume", "sess-1"]);
+
+        let mut f = fixture(10.0, 5.0, true, OnLimit::Auto);
+        let t = start_with_transcript(&mut f, &finished_turn());
+        workflow_agent_writes(&t);
+        let mut ctl = Control::default();
+        f.host
+            .on_action(UiAction::SwitchTo(Some("b".into())), &mut ctl);
+        let a = args(&ctl.take_restart().expect("restart"));
+        assert!(
+            a[a.len() - 1].starts_with(
+                "[agent-prism] This conversation moved by hand from account Acct A \
+                 to account Acct B and `claude` restarted."
+            ),
+            "{}",
+            a[a.len() - 1]
+        );
     }
 
     #[test]
