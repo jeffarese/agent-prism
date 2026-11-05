@@ -8,6 +8,9 @@ use std::process::Command;
 use crate::model::Tool;
 use crate::profile::Profile;
 
+/// `(pid, name)` per process.
+type PidNames = Vec<(u32, String)>;
+
 /// A running `claude` (or `codex`) of the current user.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunningClaude {
@@ -37,7 +40,7 @@ pub fn running(tool: Tool) -> Vec<RunningClaude> {
 /// For every process of the user: `(pid, argv[0])` and `(pid, executable
 /// name)`, from `ps`.
 #[cfg(not(target_os = "linux"))]
-fn names() -> Option<(Vec<(u32, String)>, Vec<(u32, String)>)> {
+fn names() -> Option<(PidNames, PidNames)> {
     Some((ps_column("comm=")?, ps_column("ucomm=")?))
 }
 
@@ -45,7 +48,7 @@ fn names() -> Option<(Vec<(u32, String)>, Vec<(u32, String)>)> {
 /// name)`, from `/proc`. Linux `ps` has no `ucomm` and its `comm` is the
 /// executable's name cut to 15 bytes, not argv[0].
 #[cfg(target_os = "linux")]
-fn names() -> Option<(Vec<(u32, String)>, Vec<(u32, String)>)> {
+fn names() -> Option<(PidNames, PidNames)> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions.
     let me = unsafe { libc::geteuid() };
