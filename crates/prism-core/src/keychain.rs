@@ -1,4 +1,5 @@
-//! OAuth credentials from the macOS Keychain (DESIGN §6.1).
+//! OAuth credentials from the macOS Keychain, or from `.credentials.json`
+//! where there is no Keychain (Linux) (DESIGN §6.1).
 //!
 //! Secrets rule: tokens are never printed, logged or put in an error.
 
@@ -59,16 +60,28 @@ pub trait SecretStore: Send + Sync {
     fn read(&self, service: &str) -> Result<Option<String>>;
 }
 
-/// Reads the Keychain via `/usr/bin/security`.
+/// The macOS Keychain tool.
+const SECURITY: &str = "/usr/bin/security";
+
+/// Reads the Keychain via `/usr/bin/security`. Where there is no Keychain
+/// (Linux), every read is `None`: Claude Code keeps its login in
+/// `<config dir>/.credentials.json` there, which `read_credentials` reads next.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SecurityCli;
 
 impl SecretStore for SecurityCli {
     fn read(&self, service: &str) -> Result<Option<String>> {
-        let out = Command::new("/usr/bin/security")
+        if !std::path::Path::new(SECURITY).exists() {
+            return Ok(None);
+        }
+        let out = match Command::new(SECURITY)
             .args(["find-generic-password", "-s", service, "-w"])
             .output()
-            .context("running /usr/bin/security")?;
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("running /usr/bin/security"),
+        };
         match out.status.code() {
             Some(0) => {
                 let s = String::from_utf8(out.stdout)

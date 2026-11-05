@@ -2,6 +2,7 @@
 //! (DESIGN §4.5).
 
 use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 
 use crate::model::Tool;
@@ -24,7 +25,7 @@ pub fn running_claudes() -> Vec<RunningClaude> {
 
 /// Best-effort list of the current user's processes of `tool`.
 pub fn running(tool: Tool) -> Vec<RunningClaude> {
-    let (Some(comm), Some(ucomm)) = (ps_column("comm="), ps_column("ucomm=")) else {
+    let Some((comm, ucomm)) = names() else {
         return Vec::new();
     };
     tool_pids(tool.bin(), &comm, &ucomm, std::process::id())
@@ -33,8 +34,57 @@ pub fn running(tool: Tool) -> Vec<RunningClaude> {
         .collect()
 }
 
+/// For every process of the user: `(pid, argv[0])` and `(pid, executable
+/// name)`, from `ps`.
+#[cfg(not(target_os = "linux"))]
+fn names() -> Option<(Vec<(u32, String)>, Vec<(u32, String)>)> {
+    Some((ps_column("comm=")?, ps_column("ucomm=")?))
+}
+
+/// For every process of the user: `(pid, argv[0])` and `(pid, executable
+/// name)`, from `/proc`. Linux `ps` has no `ucomm` and its `comm` is the
+/// executable's name cut to 15 bytes, not argv[0].
+#[cfg(target_os = "linux")]
+fn names() -> Option<(Vec<(u32, String)>, Vec<(u32, String)>)> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let mut comm = Vec::new();
+    let mut ucomm = Vec::new();
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if e.metadata().map(|m| m.uid()).ok() != Some(me) {
+            continue;
+        }
+        let dir = e.path();
+        let Ok(cmdline) = std::fs::read(dir.join("cmdline")) else {
+            continue;
+        };
+        let Some(argv0) = cmdline.split(|b| *b == 0).next().filter(|a| !a.is_empty()) else {
+            continue; // kernel thread or zombie
+        };
+        comm.push((pid, String::from_utf8_lossy(argv0).into_owned()));
+        let exe = std::fs::read_link(dir.join("exe"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|n| n.trim_end_matches(" (deleted)").to_string())
+            .or_else(|| {
+                std::fs::read_to_string(dir.join("comm"))
+                    .ok()
+                    .map(|c| c.trim_end().to_string())
+            });
+        if let Some(exe) = exe {
+            ucomm.push((pid, exe));
+        }
+    }
+    Some((comm, ucomm))
+}
+
 /// `(pid, value)` for every process of the user from `ps -xo pid=,<col>`.
 /// The value is the rest of the line, so it may contain spaces.
+#[cfg(not(target_os = "linux"))]
 fn ps_column(col: &str) -> Option<Vec<(u32, String)>> {
     let out = Command::new("ps")
         .args(["-xo", &format!("pid=,{col}")])
@@ -43,6 +93,7 @@ fn ps_column(col: &str) -> Option<Vec<(u32, String)>> {
     Some(parse_ps(&String::from_utf8_lossy(&out.stdout)))
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn parse_ps(text: &str) -> Vec<(u32, String)> {
     text.lines()
         .filter_map(|l| {
@@ -68,6 +119,7 @@ fn tool_pids(bin: &str, comm: &[(u32, String)], ucomm: &[(u32, String)], me: u32
         .collect()
 }
 
+#[cfg(not(target_os = "linux"))]
 fn inspect(tool: Tool, pid: u32) -> RunningClaude {
     let out = Command::new("ps")
         .args(["-Eww", "-o", "command=", "-p", &pid.to_string()])
@@ -75,6 +127,25 @@ fn inspect(tool: Tool, pid: u32) -> RunningClaude {
     let text = out
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
+    parse_command(tool, pid, &text)
+}
+
+/// The command line and, when readable, the environment of `pid`, as words
+/// the way `ps -E` prints them.
+#[cfg(target_os = "linux")]
+fn inspect(tool: Tool, pid: u32) -> RunningClaude {
+    let words = |file: &str| -> String {
+        std::fs::read(format!("/proc/{pid}/{file}"))
+            .map(|b| {
+                b.split(|c| *c == 0)
+                    .filter(|w| !w.is_empty())
+                    .map(|w| String::from_utf8_lossy(w).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    };
+    let text = format!("{} {}", words("cmdline"), words("environ"));
     parse_command(tool, pid, &text)
 }
 

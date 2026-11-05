@@ -126,7 +126,12 @@ pub fn run(
     println!("Ctrl+C stops it.");
     log::info!("dashboard on {url}");
     if open {
-        match std::process::Command::new("/usr/bin/open")
+        let opener = if cfg!(target_os = "macos") {
+            "/usr/bin/open"
+        } else {
+            "xdg-open"
+        };
+        match std::process::Command::new(opener)
             .arg(&url)
             .spawn()
         {

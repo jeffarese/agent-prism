@@ -282,6 +282,15 @@ pub fn find_exec_thread(db: &Path, cwd: &Path, since_ms: i64) -> Option<String> 
         .or_else(|| query_thread(db, cwd, since_ms, None, "updated_at", false))
 }
 
+/// The sqlite3 CLI: the system one on macOS, else the first on PATH.
+fn sqlite3() -> &'static str {
+    if std::path::Path::new("/usr/bin/sqlite3").exists() {
+        "/usr/bin/sqlite3"
+    } else {
+        "sqlite3"
+    }
+}
+
 fn query_thread(
     db: &Path,
     cwd: &Path,
@@ -292,7 +301,7 @@ fn query_thread(
 ) -> Option<String> {
     let cwd = cwd.to_str()?;
     for full in [true, false] {
-        let out = Command::new("/usr/bin/sqlite3")
+        let out = Command::new(sqlite3())
             .arg("-readonly")
             .arg("-noheader")
             .args(["-cmd", ".timeout 2000"])
@@ -406,7 +415,7 @@ mod tests {
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000002', '/w', 200, 200, 0, 'user', 'acc');
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000003', '/w', 300, 300, 0, 'guardian_review', 'acc');
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000004', '/w', 400, 400, 0, 'user', 'other');";
-        let ok = Command::new("/usr/bin/sqlite3").arg(&db).arg(sql).status();
+        let ok = Command::new(sqlite3()).arg(&db).arg(sql).status();
         if !ok.is_ok_and(|s| s.success()) {
             eprintln!("no sqlite3; skipped");
             return;

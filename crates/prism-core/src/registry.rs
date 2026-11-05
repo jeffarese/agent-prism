@@ -228,8 +228,38 @@ pub fn process_start(pid: u32) -> Option<i64> {
     (n == size).then_some(info.pbi_start_tvsec as i64)
 }
 
+/// When process `pid` started (unix seconds), from `/proc`; `None` when it
+/// can't be read.
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks = start_ticks(&stat)?;
+    // SAFETY: sysconf only reads a configuration value.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let btime: i64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(btime + ticks / hz as i64)
+}
+
+/// Field 22 of `/proc/<pid>/stat` (start time in clock ticks after boot).
+/// The command name (field 2) may hold spaces and parentheses, so count
+/// from the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn start_ticks(stat: &str) -> Option<i64> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// When process `pid` started; not known on this platform.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn process_start(_pid: u32) -> Option<i64> {
     None
 }
@@ -304,6 +334,24 @@ impl PickLock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proc_stat_start_ticks() {
+        let stat = "4242 (we(ir d)) S 1 4242 4242 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(super::start_ticks(stat), Some(987654));
+        assert_eq!(super::start_ticks("1 (x) S"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_start_is_known() {
+        let s = super::process_start(std::process::id()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(s <= now + 2 && s > now - 3600);
+    }
+
     use super::*;
 
     fn rec(pid: u32) -> SessionRecord {
