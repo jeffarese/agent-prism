@@ -131,8 +131,10 @@ impl Setup {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {what}: {s:#?}\nlog:\n{}",
-                self.log_text()
+                "timed out waiting for {what}: {s:#?}\nlog:\n{}\nagp log:\n{}",
+                self.log_text(),
+                std::fs::read_to_string(self.root.join("state/agent-prism.log"))
+                    .unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(200));
         }

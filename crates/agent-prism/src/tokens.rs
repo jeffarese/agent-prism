@@ -1,5 +1,6 @@
-//! Access tokens from the Keychain (Claude) and `auth.json` (Codex) for the
-//! usage poller, and a file-backed secret store for automated tests.
+//! Access tokens from the Keychain or `.credentials.json` (Claude) and
+//! `auth.json` (Codex) for the usage poller, and a file-backed secret store
+//! for automated tests.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

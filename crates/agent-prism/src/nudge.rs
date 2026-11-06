@@ -13,9 +13,10 @@
 //! token stays expired, the log says so, and the next real run refreshes it.
 //!
 //! The nudge runs detached (`agp _nudge <id>`): at most one per account at
-//! a time, and at most one every [`GAP_SECS`]. It needs the user's GUI
-//! login session, where the Keychain is readable; over SSH the token can't
-//! be read, so no nudge starts.
+//! a time, and at most one every [`GAP_SECS`]. On macOS it needs the user's
+//! GUI login session, where the Keychain is readable; over SSH the token
+//! can't be read, so no nudge starts. On Linux the login is a file, so it
+//! works over SSH too.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

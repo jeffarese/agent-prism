@@ -81,7 +81,8 @@ impl PtyChild {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                // `*mut` on macOS, `*const` on Linux: a raw pointer fits both.
+                &raw mut ws,
             )
         };
         if rc != 0 {

@@ -291,8 +291,12 @@ fn query_thread(
     user_only: bool,
 ) -> Option<String> {
     let cwd = cwd.to_str()?;
+    let Some(sqlite3) = prism_core::platform::sqlite3() else {
+        log::debug!("no sqlite3; can't find the codex thread (install sqlite3)");
+        return None;
+    };
     for full in [true, false] {
-        let out = Command::new("/usr/bin/sqlite3")
+        let out = Command::new(&sqlite3)
             .arg("-readonly")
             .arg("-noheader")
             .args(["-cmd", ".timeout 2000"])
@@ -406,7 +410,11 @@ mod tests {
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000002', '/w', 200, 200, 0, 'user', 'acc');
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000003', '/w', 300, 300, 0, 'guardian_review', 'acc');
             INSERT INTO threads VALUES ('01a00000-0000-7000-8000-000000000004', '/w', 400, 400, 0, 'user', 'other');";
-        let ok = Command::new("/usr/bin/sqlite3").arg(&db).arg(sql).status();
+        let Some(sqlite3) = prism_core::platform::sqlite3() else {
+            eprintln!("no sqlite3; skipped");
+            return;
+        };
+        let ok = Command::new(sqlite3).arg(&db).arg(sql).status();
         if !ok.is_ok_and(|s| s.success()) {
             eprintln!("no sqlite3; skipped");
             return;

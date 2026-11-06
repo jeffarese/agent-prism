@@ -46,7 +46,8 @@ fn view_ctx(config: &Config) -> ViewCtx {
 
 /// Account inputs for every configured profile, reading identity and
 /// credentials (plan, token expiry) through the context's secret store.
-/// One thread per profile: each Keychain read starts a `security` process.
+/// One thread per profile: on macOS each Keychain read starts a `security`
+/// process.
 pub fn account_inputs(ctx: &AppCtx, config: &Config) -> Vec<AccountInput> {
     let t = now();
     let input = |p: &Profile| {
@@ -211,7 +212,10 @@ pub fn login_state(token: &TokenState) -> (&'static str, bool) {
         TokenState::Valid { .. } => ("logged in", true),
         TokenState::Expired { .. } => ("logged in · idle", true),
         TokenState::Missing => ("not logged in", false),
-        TokenState::Unreadable(_) => ("keychain error", false),
+        TokenState::Unreadable(_) if prism_core::platform::has_keychain() => {
+            ("keychain error", false)
+        }
+        TokenState::Unreadable(_) => ("login unreadable", false),
     }
 }
 

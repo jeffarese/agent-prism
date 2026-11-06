@@ -1,4 +1,6 @@
-//! OAuth credentials from the macOS Keychain (DESIGN §6.1).
+//! Claude's OAuth credentials (DESIGN §6.1): from the macOS Keychain, or on
+//! Linux and WSL from `<config dir>/.credentials.json`, where Claude Code
+//! keeps them.
 //!
 //! Secrets rule: tokens are never printed, logged or put in an error.
 
@@ -81,6 +83,39 @@ impl SecretStore for SecurityCli {
     }
 }
 
+/// The store of a system without a Keychain (Linux, WSL): it holds nothing,
+/// so [`read_credentials`] reads `<dir>/.credentials.json`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoKeychain;
+
+impl SecretStore for NoKeychain {
+    fn read(&self, _service: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// The secret store of this system: the Keychain on macOS, none elsewhere.
+pub fn platform_store() -> std::sync::Arc<dyn SecretStore> {
+    if crate::platform::has_keychain() {
+        std::sync::Arc::new(SecurityCli)
+    } else {
+        std::sync::Arc::new(NoKeychain)
+    }
+}
+
+/// Where a Claude login lives, as `(label, place)`: `("keychain", <item>)`
+/// on macOS, else `("login", <dir>/.credentials.json)`.
+pub fn login_location(profile: &Profile) -> (&'static str, String) {
+    if crate::platform::has_keychain() {
+        ("keychain", profile.keychain_service())
+    } else {
+        (
+            "login",
+            profile.dir.join(".credentials.json").display().to_string(),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 struct Blob {
     #[serde(rename = "claudeAiOauth")]
@@ -147,6 +182,7 @@ pub fn read_credentials(store: &dyn SecretStore, profile: &Profile) -> Result<Op
     }
     let file = profile.dir.join(".credentials.json");
     match std::fs::read_to_string(&file) {
+        Ok(json) if logged_out(&json) => Ok(None),
         Ok(json) => parse_credentials(&json)
             .map(Some)
             .with_context(|| format!("in {}", file.display())),
@@ -226,6 +262,35 @@ pub(crate) mod tests {
                 since: 1_760_500_000
             }
         );
+    }
+
+    #[test]
+    fn without_a_keychain_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude-a");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Profile::bare("a", Tool::Claude, dir.clone(), tmp.path().join(".claude"));
+        assert!(read_credentials(&NoKeychain, &p).unwrap().is_none());
+        std::fs::write(dir.join(".credentials.json"), SAMPLE).unwrap();
+        let c = read_credentials(&NoKeychain, &p).unwrap().unwrap();
+        assert_eq!(c.subscription_type.as_deref(), Some("team"));
+        std::fs::write(dir.join(".credentials.json"), "SECRET garbage").unwrap();
+        let e = read_credentials(&NoKeychain, &p).unwrap_err();
+        assert!(!format!("{e:#}").contains("SECRET"), "{e:#}");
+        // What Claude leaves after a refused refresh: no login, not an error.
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#,
+        )
+        .unwrap();
+        assert!(read_credentials(&NoKeychain, &p).unwrap().is_none());
+        let at = login_location(&p);
+        if crate::platform::has_keychain() {
+            assert_eq!(at, ("keychain", p.keychain_service()));
+        } else {
+            let file = dir.join(".credentials.json").display().to_string();
+            assert_eq!(at, ("login", file));
+        }
     }
 
     #[test]

@@ -126,14 +126,7 @@ pub fn run(
     println!("Ctrl+C stops it.");
     log::info!("dashboard on {url}");
     if open {
-        match std::process::Command::new("/usr/bin/open")
-            .arg(&url)
-            .spawn()
-        {
-            // Reap it in the background; `open` returns at once.
-            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
-            Err(e) => eprintln!("agp: could not open the browser: {e}"),
-        }
+        open_browser(&url);
     }
 
     listener.set_nonblocking(true)?;
@@ -165,6 +158,28 @@ pub fn run(
     let _ = refresher.join();
     println!("\nDashboard stopped.");
     Ok(0)
+}
+
+/// Opens `url` in the browser: `open` on macOS, `xdg-open` on a Linux
+/// desktop, the Windows browser from WSL. Without one (a server over SSH)
+/// it only says where to point a browser.
+fn open_browser(url: &str) {
+    let Some((prog, args)) = prism_core::platform::url_opener() else {
+        println!("Open {url} in a browser (no browser to start here).");
+        return;
+    };
+    match std::process::Command::new(&prog)
+        .args(args)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // Reap it in the background; openers return at once.
+        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+        Err(e) => eprintln!("agp: could not open the browser ({}): {e}", prog.display()),
+    }
 }
 
 /// Refreshes stale usage of every account now and then every

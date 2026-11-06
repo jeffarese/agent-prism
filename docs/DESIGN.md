@@ -6,7 +6,7 @@ with the most usable quota. It wraps the session in a PTY and keeps a small
 When a limit stops the active account, agent-prism moves the same conversation to
 the next account (`--resume`). A hotkey opens a menu and the settings panel.
 
-Platform: macOS (Keychain, `/usr/bin/security`). Language: Rust 2024.
+Platforms: macOS, Linux and WSL 2 (§1.1). Language: Rust 2024.
 
 ## 1. Concepts
 
@@ -30,6 +30,27 @@ Platform: macOS (Keychain, `/usr/bin/security`). Language: Rust 2024.
 
 A dir with no `oauthAccount` and a custom `ANTHROPIC_BASE_URL` (a local
 proxy setup) is never offered as an account.
+
+
+### 1.1 Platforms
+
+agent-prism runs on macOS and Linux; WSL 2 is Linux with a Windows browser.
+What differs lives in `prism_core::platform` or behind a `cfg`:
+
+| | macOS | Linux, WSL |
+| --- | --- | --- |
+| Claude login | Keychain item (§6.1), read with `/usr/bin/security`; `<dir>/.credentials.json` as a fallback | `<dir>/.credentials.json` only (what Claude Code writes there, mode 0600); no Keychain is read |
+| Running claude/codex (§4.5) | `ps` | `/proc/<pid>/{cmdline,exe,environ}` |
+| Process start time (pid reuse) | `proc_pidinfo` | `/proc/<pid>/stat` + `btime` |
+| Backup tar (§4.4) | bsdtar `--no-mac-metadata` | GNU tar, no flag |
+| `sqlite3` (§12) | `/usr/bin/sqlite3` | the first on `PATH`; without it a Codex thread id is not found |
+| Opening the dashboard | `open` | `xdg-open` (or `gio open`) with a desktop; on WSL `wslview`, else `explorer.exe`; no desktop: print the URL |
+
+The nudge (§6.3) works over SSH on Linux, since the login is a file.
+`agp doctor` prints the platform (`macOS`, `Linux`, `WSL`), says where each
+login lives, and warns when `sqlite3` is missing or, on WSL, when the work dir
+is on the Windows drive (`/mnt/…`). WSL is detected from the kernel release
+(`microsoft`) or `WSL_DISTRO_NAME`.
 
 ## 2. Files and paths
 
@@ -231,7 +252,7 @@ Safety:
 
 ### 4.4 Backup
 
-`tar -czf` of the profile dir (`--no-mac-metadata` to skip `._` files) plus
+`tar -czf` of the profile dir (on macOS `--no-mac-metadata` to skip `._` files) plus
 `<common>/history.jsonl`. Target `ssh://host/path` streams over
 `ssh -o BatchMode=yes host 'mkdir -p path && cat > path/<name>.tar.gz'`, then
 checks remote size > 0 with `ssh host stat`. A local target writes the file.
@@ -239,8 +260,10 @@ Name: `<YYYY-MM-DD>-<profile>-<HHMMSS>.tar.gz`.
 
 ### 4.5 Running-Claude detection
 
-`ps -Ao pid=,comm=` for `claude` processes, then `ps -Eww -o command= -p <pid>`
-(own processes only) and look for `CLAUDE_CONFIG_DIR=<dir>`. A claude with no
+macOS: `ps -Ao pid=,comm=` for `claude` processes, then `ps -Eww -o command= -p <pid>`
+(own processes only) and look for `CLAUDE_CONFIG_DIR=<dir>`. Linux: the same
+from `/proc` (`argv[0]` from `cmdline`, the executable from `exe`, the
+start-up environment from `environ`, own uid only). A claude with no
 `CLAUDE_CONFIG_DIR` belongs to the default install. Best effort; report
 "unknown" when env is not readable.
 
@@ -307,7 +330,9 @@ Example: `/Users/me/.claude-work` → `1e91dd84`. Read with
 `/usr/bin/security find-generic-password -s <service> -w`. The value is JSON:
 `{"claudeAiOauth":{"accessToken","refreshToken","expiresAt"(ms),"scopes",
 "subscriptionType","rateLimitTier"}}`. Fallback: `<dir>/.credentials.json`
-(often stale).
+(often stale on macOS). On Linux and WSL there is no Keychain: Claude Code
+keeps the same JSON in `<dir>/.credentials.json`, and that file is the
+login (§1.1).
 
 **Secrets rule:** never print, log, cache, or put a token in an error
 message. The token type has a redacting `Debug`. Only `expiresAt`,
@@ -372,8 +397,9 @@ starts no MCP server and makes no model call; tested live on one account
   (only `expiresAt`, never the secret), records before/after, and on success
   polls the account's usage at once. agent-prism still never writes the
   Keychain.
-- It needs the GUI login session: over SSH the Keychain can't be read, the
-  token shows as unreadable and no nudge starts. `AGP_NO_POLL` turns it off.
+- On macOS it needs the GUI login session: over SSH the Keychain can't be
+  read, the token shows as unreadable and no nudge starts. On Linux the
+  login is a file, so it works over SSH too. `AGP_NO_POLL` turns it off.
 - If a later Claude stops refreshing there, nothing breaks: the token stays
   expired, the log says so, and the next run refreshes it. A refused refresh
   leaves the item empty, which reads as no login (above).
@@ -1379,7 +1405,7 @@ accounts so that `codex resume <id>` finds the thread. Non-interactive lines
 
 **Session id.** Codex has no `--session-id`, and its hooks need a trust
 prompt, so agp adds no hooks. Every 3 s the host runs
-`/usr/bin/sqlite3 -readonly` on `state_<n>.sqlite`: the newest thread with
+`sqlite3 -readonly` (§1.1) on `state_<n>.sqlite`: the newest thread with
 `thread_source = 'user'` in the work dir (`-C`, else cwd) created after the
 child started, by the active `creator_account_id`. For `resume` without a
 UUID (picker, `--last`, a name) it takes the thread updated most recently

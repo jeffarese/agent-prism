@@ -51,6 +51,7 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
         );
     }
     println!("state      {}", ctx.paths.state_dir.display());
+    platform_lines(has_codex, &mut tips);
     let now = unix_now();
     let claude = config.profiles_for(&ctx.paths, Tool::Claude);
     for p in profiles {
@@ -92,7 +93,8 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
         let mut own_settings = false;
         match p.tool {
             Tool::Claude => {
-                println!("  keychain {}", p.keychain_service());
+                let (label, place) = keychain::login_location(&p);
+                println!("  {label:<8} {place}");
                 own_settings = settings_line(&ctx.paths, &config, &p, &mut tips);
                 if let Some((own, missing)) = prism_core::trust::status(&ctx.paths, &p, &claude) {
                     println!(
@@ -297,4 +299,32 @@ fn settings_line(
         }
     }
     false
+}
+
+/// The system, and what agent-prism needs from it there.
+fn platform_lines(has_codex: bool, tips: &mut Vec<String>) {
+    use prism_core::platform::{self, Os};
+    let os = platform::os();
+    let logins = if platform::has_keychain() {
+        "Claude logins in the Keychain"
+    } else {
+        "Claude logins in <dir>/.credentials.json"
+    };
+    println!("platform   {} ({logins})", os.label());
+    if has_codex && platform::sqlite3().is_none() {
+        println!("  sqlite3  missing: codex resume can't find threads");
+        tips.push(match os {
+            Os::MacOs => "install sqlite3 (it ships with macOS at /usr/bin/sqlite3)".into(),
+            _ => "install sqlite3 (apt install sqlite3, dnf install sqlite)".into(),
+        });
+    }
+    if os == Os::Wsl
+        && let Ok(cwd) = std::env::current_dir()
+        && cwd.starts_with("/mnt")
+    {
+        tips.push(format!(
+            "{} is on the Windows drive: Claude and git are much faster in the Linux file system (~/…)",
+            cwd.display()
+        ));
+    }
 }

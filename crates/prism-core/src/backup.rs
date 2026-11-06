@@ -45,12 +45,12 @@ fn tar_command(dir: &Path, common_history: &Path) -> Result<Command> {
     let parent = dir.parent().context("profile dir has no parent")?;
     let name = dir.file_name().context("profile dir has no name")?;
     let mut cmd = Command::new("tar");
-    cmd.arg("--no-mac-metadata")
-        .arg("-czf")
-        .arg("-")
-        .arg("-C")
-        .arg(parent)
-        .arg(name);
+    // macOS's bsdtar adds `._` files for extended attributes unless told
+    // not to; GNU tar (Linux) has no such files and no such flag.
+    if cfg!(target_os = "macos") {
+        cmd.arg("--no-mac-metadata");
+    }
+    cmd.arg("-czf").arg("-").arg("-C").arg(parent).arg(name);
     if let (Some(hp), Some(hn)) = (common_history.parent(), common_history.file_name())
         && common_history.is_file()
     {

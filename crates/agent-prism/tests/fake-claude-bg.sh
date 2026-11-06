@@ -33,6 +33,11 @@ write_state() { # short state
     "$2" "$(cat "$j/sid")" "$(esc "$(cat "$j/cwd")")" "$(esc "$(cat "$j/name")")" "$(cat "$j/flags")" "$t" "$(cat "$j/created")" > "$j/state.json"
 }
 
+# A new session id. Linux distributions don't always ship uuidgen.
+new_sid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi | tr 'A-Z' 'a-z'
+}
+
 alive() { [ -f "$jobs/$1/pid" ] && kill -0 "$(cat "$jobs/$1/pid")" 2>/dev/null; }
 
 start_proc() { # short
@@ -119,7 +124,7 @@ done
 flags="[$flags]"
 
 if [ -z "$resume" ]; then
-  new_job "$(uuidgen | tr 'A-Z' 'a-z')" "$name" "$flags"
+  new_job "$(new_sid)" "$name" "$flags"
   exit 0
 fi
 short=$(job_of "$resume")
@@ -127,7 +132,7 @@ if [ -n "$short" ]; then
   if [ "$flags" != "[]" ] || alive "$short"; then
     # Flags, or the old process still runs: a copy under a new id.
     echo "note: already running in the background, so this started a copy"
-    new_job "$(uuidgen | tr 'A-Z' 'a-z')" "$(cat "$jobs/$short/name") (copy)" "$(cat "$jobs/$short/flags")"
+    new_job "$(new_sid)" "$(cat "$jobs/$short/name") (copy)" "$(cat "$jobs/$short/flags")"
     exit 0
   fi
   start_proc "$short"

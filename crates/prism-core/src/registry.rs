@@ -228,8 +228,38 @@ pub fn process_start(pid: u32) -> Option<i64> {
     (n == size).then_some(info.pbi_start_tvsec as i64)
 }
 
+/// When process `pid` started (unix seconds), from `/proc/<pid>/stat` and
+/// the boot time in `/proc/stat`; `None` when they can't be read.
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let boot = std::fs::read_to_string("/proc/stat").ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    linux_start(&stat, &boot, ticks)
+}
+
+/// The start time from the text of `/proc/<pid>/stat` and `/proc/stat`.
+#[cfg(any(target_os = "linux", test))]
+fn linux_start(stat: &str, boot: &str, ticks_per_sec: i64) -> Option<i64> {
+    if ticks_per_sec <= 0 {
+        return None;
+    }
+    // `comm` (field 2) is in parentheses and may hold spaces or `)`: count
+    // from the last `)`. `starttime` is field 22, the 20th after it.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let since_boot: i64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    let btime: i64 = boot
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(btime + since_boot / ticks_per_sec)
+}
+
 /// When process `pid` started; not known on this platform.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn process_start(_pid: u32) -> Option<i64> {
     None
 }
@@ -320,6 +350,37 @@ mod tests {
             pid_start: None,
             load: None,
             transcript: None,
+        }
+    }
+
+    #[test]
+    fn start_time_from_proc() {
+        let stat = "4242 (a (weird) name) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 12345 1000 10 18446744073709551615";
+        let boot = "cpu  1 2 3\nbtime 1700000000\nprocesses 99\n";
+        assert_eq!(linux_start(stat, boot, 100), Some(1_700_000_123));
+        assert_eq!(linux_start(stat, "cpu 1\n", 100), None);
+        assert_eq!(linux_start("garbage", boot, 100), None);
+        assert_eq!(linux_start(stat, boot, 0), None);
+    }
+
+    /// The start time of a child just started is now, on every platform
+    /// that knows it; that is what tells a reused pid from our run.
+    #[test]
+    fn start_time_of_a_new_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let got = process_start(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let got = got.expect("start time");
+            assert!((now - got).abs() <= 3, "now {now}, start {got}");
         }
     }
 

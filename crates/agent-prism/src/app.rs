@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use prism_core::config::Config;
-use prism_core::keychain::{SecretStore, SecurityCli};
+use prism_core::keychain::SecretStore;
 use prism_core::model::Tool;
 use prism_core::paths::Paths;
 use prism_core::profile::Profile;
@@ -67,12 +67,13 @@ impl AppCtx {
     }
 }
 
-/// The secret store: `/usr/bin/security`, or — for automated tests only —
-/// a JSON file `{service: value}` named by `AGP_SECRET_STORE_FILE`.
+/// The secret store: the Keychain via `/usr/bin/security` on macOS, none on
+/// Linux (logins are files there), or — for automated tests only — a JSON
+/// file `{service: value}` named by `AGP_SECRET_STORE_FILE`.
 fn secret_store_from_env() -> Arc<dyn SecretStore> {
     match prism_core::env::var_os("AGP_SECRET_STORE_FILE") {
         Some(f) => Arc::new(crate::tokens::FileStore::new(f.into())),
-        None => Arc::new(SecurityCli),
+        None => prism_core::keychain::platform_store(),
     }
 }
 

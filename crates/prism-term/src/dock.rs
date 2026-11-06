@@ -429,7 +429,9 @@ fn pool_line(model: &DockModel, label_w: usize, tier_w: usize, cols: Cols) -> Li
 }
 
 fn local_hhmm(t: i64) -> String {
-    let tt = t as libc::time_t;
+    // The type is `time_t`, inferred: naming it warns on musl, whose
+    // `time_t` changes width.
+    let tt = t as _;
     // SAFETY: localtime_r writes into the provided struct only.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&tt, &mut tm).is_null() };
