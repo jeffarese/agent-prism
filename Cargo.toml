@@ -27,7 +27,7 @@ fs4 = "1"
 ureq = { version = "3", features = ["json"] }
 ratatui = "0.30"
 crossterm = "0.29"
-vt100 = "0.16"
+vt100 = "0.18"
 tui-term = "0.3"
 rustix = { version = "1", features = ["termios", "process", "pty", "stdio", "fs"] }
 libc = "0.2"
