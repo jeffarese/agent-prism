@@ -6,7 +6,7 @@ members = ["crates/prism-core", "crates/prism-usage", "crates/prism-term", "crat
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 prism-core = { path = "crates/prism-core" }
@@ -36,3 +36,11 @@ crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 log = "0.4"
+
+# The binaries on GitHub releases (.github/workflows/release.yml): smaller and
+# a little faster than --release, for a slower build.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

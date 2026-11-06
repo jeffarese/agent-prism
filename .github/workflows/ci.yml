@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt and clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Clippy on both: some code only builds on macOS or only on Linux.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86_64, os: ubuntu-latest, expect: Linux }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, expect: Linux }
+          - { name: macOS arm64, os: macos-latest, expect: macOS }
+    runs-on: ${{ matrix.os }}
+    env:
+      AGP_TEST_EXPECT_OS: ${{ matrix.expect }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install sqlite3 (Codex thread lookups)
+        if: runner.os == 'Linux'
+        run: command -v sqlite3 || { sudo apt-get update -q && sudo apt-get install -y -q sqlite3; }
+      - run: cargo test --workspace --locked
+
+  wsl:
+    name: test (WSL 2, Ubuntu 24.04)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    steps:
+      # Scripts in the repo must keep LF endings inside WSL.
+      - name: Check out with LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: build-essential ca-certificates curl git sqlite3
+      - name: Install Rust
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      # Builds in the Linux file system: /mnt/<drive> is slow and loses
+      # file modes.
+      - name: Copy the checkout into WSL
+        run: rm -rf ~/src && mkdir ~/src && cp -a . ~/src/
+      - name: cargo test
+        run: |
+          . "$HOME/.cargo/env"
+          cd ~/src
+          uname -a
+          AGP_TEST_EXPECT_OS=WSL cargo test --workspace --locked
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --workspace --all-targets --locked
+
+  install:
+    name: install script (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: From a checkout (builds with cargo)
+        run: |
+          AGP_INSTALL_DIR="$RUNNER_TEMP/src" sh scripts/install.sh
+          "$RUNNER_TEMP/src/agp" --version
+      # The download path of `curl … | sh`, against a release packaged here.
+      - name: A release download, piped to sh
+        run: |
+          case "$(uname -s)" in
+            Darwin) os=apple-darwin ;;
+            Linux) os=unknown-linux-musl; sudo apt-get update -q && sudo apt-get install -y -q musl-tools ;;
+          esac
+          target=$(uname -m | sed 's/^arm64$/aarch64/')-$os
+          rustup target add "$target"
+          cargo build --release --locked -p agent-prism --target "$target"
+          sh scripts/package.sh "$target" "target/$target/release/agp"
+          export AGP_DOWNLOAD_URL="file://$PWD/dist" AGP_INSTALL_DIR="$RUNNER_TEMP/rel"
+          sh < scripts/install.sh
+          "$RUNNER_TEMP/rel/agp" --version
+          # A damaged download installs nothing.
+          rm "$RUNNER_TEMP/rel/agp"
+          echo damaged >> "dist/agp-$target.tar.gz"
+          if sh < scripts/install.sh; then echo "::error::installed a damaged download"; exit 1; fi
+          [ ! -e "$RUNNER_TEMP/rel/agp" ]

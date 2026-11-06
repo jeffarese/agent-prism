@@ -1,5 +1,7 @@
 # agent-prism
 
+[![CI](https://github.com/jeffarese/agent-prism/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffarese/agent-prism/actions/workflows/ci.yml)
+
 `agp` starts Claude Code on the Claude account with the most usable quota,
 and keeps a dock with the usage of all your accounts below the normal Claude
 screen. When a limit stops the active account, agent-prism moves the same
@@ -15,8 +17,10 @@ In scripts and CI, `agp` is a drop-in for `claude -p` and `codex exec`:
 same args, stdin, stdout, stderr and exit code. See
 [Drop-in for `claude -p` and `codex exec`](#drop-in-for-claude--p-and-codex-exec).
 
-Platform: macOS only. agent-prism reads Claude logins from the macOS
-Keychain.
+Platforms: macOS, Linux and Windows through WSL 2, on x86_64 and arm64.
+On macOS agent-prism reads Claude logins from the Keychain; on Linux and
+WSL, from the file Claude Code keeps them in. See
+[Linux and WSL](#linux-and-wsl).
 
 ![agp starts Claude on the best account, hits the 5-hour limit, and resumes the conversation on the next account](docs/demo.gif)
 
@@ -25,13 +29,26 @@ The demo and the images below use fictional accounts and a stand-in for
 
 ## Install
 
-Needs Rust 1.88 or later, and `claude` (or `codex`) on your PATH.
+Needs `claude` (or `codex`) on your PATH. On WSL, install them inside WSL,
+not on the Windows side.
+
+A release build, for macOS or Linux (WSL too), x86_64 or arm64; the script
+checks the download's SHA-256:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jeffarese/agent-prism/main/scripts/install.sh | sh
+```
+
+From source instead, with Rust 1.89 or later:
 
 ```sh
 scripts/install.sh        # builds and installs ~/.local/bin/agp
 ```
 
-Set `AGP_INSTALL_DIR` to install to a different directory.
+Both install `~/.local/bin/agp`; run the same line again to update. Set
+`AGP_INSTALL_DIR` to install somewhere else, `AGP_VERSION=0.2.0` for a
+given release, and `--prebuilt` to download from inside a checkout. The
+Linux builds are static, so they run on any distribution.
 
 ## First run
 
@@ -44,7 +61,7 @@ step, except things that you confirm on the way.
       <b>1. Welcome.</b> What agent-prism does.</td>
     <td width="50%"><img src="docs/images/onboarding-accounts.png" alt="Accounts step"><br>
       <b>2. Accounts.</b> agent-prism finds the Claude and Codex logins on
-      this Mac. Choose the ones to use and give them short names.</td>
+      this machine. Choose the ones to use and give them short names.</td>
   </tr>
   <tr>
     <td><img src="docs/images/onboarding-sharing.png" alt="Sharing step"><br>
@@ -174,7 +191,8 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
   new login. To keep idle tokens fresh, set `[usage] token_refresh =
   "nudge"`: agent-prism then runs `claude mcp get <made-up name>` on an idle
   account now and then, which refreshes the token without a model call
-  (needs your desktop session; it can't read the Keychain over SSH).
+  (on macOS it needs your desktop session, since the Keychain can't be read
+  over SSH; on Linux it works over SSH too).
 
 ## Per-run options
 
@@ -281,7 +299,7 @@ lanes, background sessions and status. The text is built into `agp`, so an
 install always matches the binary.
 
 ```sh
-agp skill install                  # every agent found on this Mac
+agp skill install                  # every agent found on this machine
 agp skill install --agent gemini   # only these (repeat it or use a,b)
 agp skill install --dir ~/my-agent/skills   # any Agent Skills folder: <dir>/agp
 agp skill list                     # each target, and whether its copy is current
@@ -361,7 +379,7 @@ tailscale serve --bg 8787
 
 ## In a session
 
-In a session, `⌃\` opens the menu: switch account now, settings, accounts,
+In a session, `⌃\` (`Ctrl+\`) opens the menu: switch account now, settings, accounts,
 refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
 (or Codex).
 
@@ -384,8 +402,8 @@ refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
   daemon, caches) stay in the dir. `agp adopt` sets this up with a backup
   first.
 - Usage comes from the same endpoint Claude Code uses, with each account's
-  token from the Keychain. agent-prism never prints or stores tokens and never
-  writes to the Keychain.
+  token from the Keychain (macOS) or its `.credentials.json` (Linux, WSL).
+  agent-prism never prints or stores tokens and never writes a login.
 - agent-prism points Claude's auto memory at the real `~/.claude/projects/...`
   path, so memory writes through the shared symlink don't prompt.
 - agent-prism adds its hooks with `claude --settings`; your `settings.json` does
@@ -415,6 +433,62 @@ refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
 
 Config: `~/.config/agent-prism/config.toml`. State and logs: `~/.local/state/agent-prism/`.
 Design: [docs/DESIGN.md](docs/DESIGN.md).
+
+## Linux and WSL
+
+agent-prism works the same on Linux and in WSL 2. What differs:
+
+- **Logins.** Claude Code on Linux keeps each account's login in
+  `<config dir>/.credentials.json` (`~/.claude-<id>/.credentials.json`)
+  instead of the Keychain, and agent-prism reads it there. `agp add` and
+  `/login` work as on macOS. `agp doctor` shows the file of each account.
+- **Running sessions** are found in `/proc` rather than with `ps`.
+- **Idle-token nudges** (`token_refresh = "nudge"`) also work over SSH.
+- **Codex threads**: `agp codex` finds the thread id with `sqlite3`. Install
+  it if your distribution lacks it (`apt install sqlite3`); `agp doctor`
+  says when it is missing.
+- **The dashboard** opens with `xdg-open` on a Linux desktop. Over SSH or
+  on a server it prints the URL instead.
+
+In WSL:
+
+- Install and log in to Claude Code (and Codex) inside WSL. The Windows
+  `claude.exe` keeps its own logins, which agent-prism doesn't see.
+- Keep your repositories in the Linux file system (`~/src/...`), not on
+  `/mnt/c`: Claude, git and the transcripts are much faster there.
+  `agp doctor` warns when the current folder is on a Windows drive.
+- `agp dashboard` opens the Windows browser (with `wslview` when wslu is
+  installed, else `explorer.exe`). WSL forwards `127.0.0.1`, so the page
+  loads as on Linux.
+
+## Development
+
+```sh
+cargo test --workspace                                  # unit and end-to-end tests
+cargo clippy --workspace --all-targets -- -D warnings   # lints, as CI runs them
+cargo fmt --all                                         # formatting
+```
+
+The tests never touch your `~/.claude*`, your config or the Keychain: each
+points `HOME`, `AGP_CONFIG_DIR` and `AGP_STATE_DIR` at a temp dir and runs a
+stand-in `claude`. On a Mac, the Linux code runs in a container:
+
+```sh
+docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1 cargo test --workspace
+```
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs fmt, clippy
+on macOS and Linux, the tests on Linux x86_64 and arm64, macOS and WSL 2,
+a build with the oldest supported Rust (1.89), and both ways of
+`scripts/install.sh`.
+
+To release, run `sh scripts/release.sh X.Y.Z` from a clean `main`. It sets
+the version, runs the tests, and pushes tag `vX.Y.Z`. The
+[Release workflow](.github/workflows/release.yml) then builds `agp` for
+macOS (arm64, x86_64) and Linux (x86_64, arm64; static musl), and publishes
+the archives, their `SHA256SUMS` and build provenance on the GitHub release.
+`gh attestation verify agp-<target>.tar.gz -R jeffarese/agent-prism`
+checks a download.
 
 ## Caveats
 
