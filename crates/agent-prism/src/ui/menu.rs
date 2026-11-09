@@ -161,7 +161,7 @@ impl MenuPanel {
             out.push(Target {
                 target: Some(v.profile_id.clone()),
                 line: account_line(v, i, is_current),
-                enabled: blocked.is_none() && !is_current && v.limited.is_none(),
+                enabled: blocked.is_none() && !is_current,
             });
         }
         out
@@ -701,6 +701,24 @@ mod tests {
         ));
         m.handle_key(key(KeyCode::Esc));
         assert!(matches!(m.view, View::Main));
+    }
+
+    /// A limited account can be chosen: to spend a limit reset there.
+    #[test]
+    fn limited_account_can_be_picked() {
+        let (_f, mut m) = menu();
+        m.live.lock().views[1].limited = Some(prism_core::model::Limited {
+            kind: prism_core::model::LimitKind::SevenDay,
+            until: None,
+        });
+        m.handle_key(ch('w'));
+        assert!(render(&mut m, 120, 40).contains("limit"));
+        m.handle_key(key(KeyCode::Down));
+        m.handle_key(key(KeyCode::Down));
+        assert!(matches!(
+            m.handle_key(key(KeyCode::Enter)),
+            PanelOutcome::Action(UiAction::SwitchTo(Some(id))) if id == "b"
+        ));
     }
 
     #[test]

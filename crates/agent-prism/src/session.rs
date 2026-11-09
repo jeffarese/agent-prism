@@ -252,6 +252,7 @@ pub fn run(ctx: Arc<AppCtx>, args: LaunchArgs) -> Result<i32> {
         poller,
         run: args.run.clone(),
         journal: journal.clone(),
+        by_hand: args.as_profile.is_some(),
     });
     host.write_registry();
     let outcome = runner.run(&mut host, spec)?;

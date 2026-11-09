@@ -734,6 +734,12 @@ user ("Switch account now" in the menu, pick a target or "best").
    the reset on the same account"), otherwise only a message. A reset
    further away than `--max-wait` → message only. Manual switch → no
    countdown.
+   An account the user chose by hand (`--as`, or a named account in the
+   menu, which lists limited ones too) is kept under `auto` and `ask`: a
+   limit there gives a message only ("staying, you chose it"), so that the
+   user can spend a limit reset in the session or wait. The hold ends when
+   usage read after the session came to the account shows no limit, or a
+   turn ends well there; the next limit moves the session as usual.
 3. If `busy` and the trigger is manual, confirm first ("Claude is working").
 4. SIGTERM to the child's process group; wait ≤ 3 s; SIGKILL.
 5. Spawn on the target with the same cwd and args, minus the user's session

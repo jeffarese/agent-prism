@@ -383,6 +383,12 @@ In a session, `⌃\` (`Ctrl+\`) opens the menu: switch account now, settings, ac
 refresh usage, dock mode, log. Press `⌃\` twice to send `⌃\` to Claude
 (or Codex).
 
+A session stays on an account you chose yourself, even a limited one:
+`agp --as <id>`, or the account's row in the switch menu. agp only tells
+you about the limit there, so you can spend a limit reset in that session
+(or wait). Once the account is free again, a later limit moves the session
+as usual.
+
 <table>
   <tr>
     <td width="50%"><img src="docs/images/switch.png" alt="Switch account menu"><br>

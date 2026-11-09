@@ -100,6 +100,8 @@ pub struct HostInit {
     pub run: RunOptions,
     /// The run journal of this session.
     pub journal: Recorder,
+    /// The user named the account (`--as`).
+    pub by_hand: bool,
 }
 
 /// A Codex session finds its thread id in Codex's database: the newest
@@ -148,6 +150,11 @@ pub struct SessionHost {
     message: Option<(StatusMessage, i64)>,
     pending: Option<Pending>,
     limit_episode: bool,
+    /// The user put the session on the active account (`--as`, or a named
+    /// account in the switch menu) and it has not been seen free of its
+    /// limit since. A limit then moves nothing: the user may be there to
+    /// spend a limit reset, or to wait.
+    by_hand: bool,
     switched: Option<Switched>,
     poller: Option<PollerHandle>,
     run: RunOptions,
@@ -214,6 +221,7 @@ impl SessionHost {
             message: None,
             pending: None,
             limit_episode: false,
+            by_hand: init.by_hand,
             switched: None,
             last_check: now,
             last_inputs: now,
@@ -478,6 +486,14 @@ impl SessionHost {
         self.journal.write(ev);
         if self.config.balance.on_limit == OnLimit::Wait {
             self.start_wait(format!("hit the {what} limit"), interrupted);
+            return;
+        }
+        if self.by_hand {
+            log::info!("{label} hit the {what} limit; chosen by hand, staying");
+            self.set_message(
+                MessageLevel::Warn,
+                format!("{label} hit the {what} limit · staying, you chose it · ⌃\\ to move"),
+            );
             return;
         }
         // Under the pick lock with fresh claims, so that sessions that hit
@@ -785,8 +801,9 @@ impl SessionHost {
         self.since = now;
         self.busy = false;
         self.starting = resumes;
-        // The new account is not limited; a later limit is a new episode.
+        // A limit of the new account is a new episode.
         self.limit_episode = false;
+        self.by_hand = false;
         self.write_registry();
         launch::touch_last_used(&self.ctx.paths, target, now);
         if let Some(p) = &self.poller {
@@ -827,6 +844,7 @@ impl SessionHost {
                 ctl.restart_child(spec);
                 self.restart_codex_watch(now);
                 self.active = prev.id.clone();
+                self.by_hand = false;
                 self.since = now;
                 self.write_registry();
                 if let Some(p) = &self.poller {
@@ -875,6 +893,10 @@ impl SessionHost {
             "UserPromptSubmit" => self.set_busy(true),
             "Stop" => {
                 self.set_busy(false);
+                // A turn ended well: the account works.
+                if self.active_limit().is_none() {
+                    self.by_hand = false;
+                }
                 self.check_active_limit();
             }
             "SessionEnd" => self.set_busy(false),
@@ -931,8 +953,24 @@ impl SessionHost {
                 self.on_limit(Some(kind), false);
             }
             Some(_) => {}
-            None => self.limit_episode = false,
+            None => {
+                self.limit_episode = false;
+                // Usage read since the session came here shows no limit:
+                // a later one moves the session as usual.
+                if self.usage_since_arrival() {
+                    self.by_hand = false;
+                }
+            }
         }
+    }
+
+    /// Whether the active account's usage was read after the session came
+    /// to it.
+    fn usage_since_arrival(&self) -> bool {
+        self.usage
+            .get(&self.active)
+            .and_then(|u| u.snapshot.as_ref())
+            .is_some_and(|s| s.fetched_at >= self.since)
     }
 
     /// A new child runs from `now` on: threads it creates are newer.
@@ -1062,6 +1100,7 @@ impl SessionHost {
         match a {
             UiAction::SwitchTo(id) => {
                 ctl.close_panel();
+                let named = id.is_some();
                 let target = match id {
                     Some(id) => Some(id),
                     None => self.pick_other().chosen,
@@ -1069,7 +1108,9 @@ impl SessionHost {
                 match target {
                     Some(t) => {
                         let prompt = self.manual_prompt(&t);
-                        self.perform_switch(&t, prompt, ctl);
+                        if self.perform_switch(&t, prompt, ctl) {
+                            self.by_hand = named;
+                        }
                     }
                     None => self.set_message(MessageLevel::Error, "No other account to switch to"),
                 }
@@ -1280,6 +1321,7 @@ mod tests {
                 prism_core::journal::RunMode::Tui,
                 0,
             ),
+            by_hand: false,
         });
         Fixture {
             b_dir: root.join("p-b"),
@@ -1644,6 +1686,59 @@ mod tests {
             "{}",
             a[a.len() - 1]
         );
+    }
+
+    /// `--as` on a limited account stays there, whatever limits it, until
+    /// usage read after the start shows it free; then a limit moves it.
+    #[test]
+    fn chosen_limited_account_is_kept() {
+        let mut f = fixture(100.0, 5.0, true, OnLimit::Auto);
+        f.host.by_hand = true;
+        start_with_transcript(&mut f, &finished_turn());
+        f.host.check_active_limit();
+        hook(
+            &mut f.host,
+            "StopFailure",
+            serde_json::json!({"error":"rate_limit"}),
+        );
+        let m = f.host.dock_model();
+        assert!(m.countdown.is_none());
+        assert_eq!(
+            m.message.unwrap().text,
+            "Acct A hit the 5h limit · staying, you chose it · ⌃\\ to move"
+        );
+        // The limit is gone (a reset was spent): the hold ends.
+        let later = f.host.since + 10;
+        f.host.usage.insert("a".into(), snap(3.0, later));
+        f.host.check_active_limit();
+        assert!(!f.host.by_hand);
+        f.host.usage.insert("a".into(), snap(100.0, later));
+        f.host.check_active_limit();
+        let cd = f.host.dock_model().countdown.expect("countdown");
+        assert_eq!(cd.to_label, "Acct B");
+    }
+
+    /// A limited account named in the switch menu: the session moves there
+    /// and stays; the menu's best pick is not such a choice.
+    #[test]
+    fn move_by_hand_to_a_limited_account_stays() {
+        let mut f = fixture(10.0, 100.0, true, OnLimit::Auto);
+        start_with_transcript(&mut f, &finished_turn());
+        let mut ctl = Control::default();
+        f.host
+            .on_action(UiAction::SwitchTo(Some("b".into())), &mut ctl);
+        assert!(ctl.take_restart().is_some());
+        assert_eq!(f.host.active, "b");
+        f.host.check_active_limit();
+        assert!(f.host.dock_model().countdown.is_none());
+        assert!(f.host.by_hand);
+
+        let mut f = fixture(10.0, 5.0, true, OnLimit::Auto);
+        start_with_transcript(&mut f, &finished_turn());
+        let mut ctl = Control::default();
+        f.host.on_action(UiAction::SwitchTo(None), &mut ctl);
+        assert_eq!(f.host.active, "b");
+        assert!(!f.host.by_hand);
     }
 
     #[test]
