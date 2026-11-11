@@ -626,9 +626,43 @@ fn compact_pct(w: Option<&Window>) -> Span<'static> {
 /// terminals.
 #[derive(Clone, Copy)]
 struct CompactCols {
+    /// The 7d window's percent, after the 5h one.
+    seven: bool,
+    /// Time until the 7d window resets, after its percent.
+    seven_reset: bool,
     window_name: bool,
     pool: bool,
     labels: bool,
+}
+
+/// The windows after a compact entry's label: `5h 48% 7d 31% ↻3d4h`.
+fn compact_windows(
+    model: &DockModel,
+    five: Option<&Window>,
+    seven: Option<&Window>,
+    cols: CompactCols,
+) -> Vec<Span<'static>> {
+    let mut v = vec![];
+    if cols.window_name {
+        v.push(Span::styled("5h ", dim()));
+    }
+    v.push(compact_pct(five));
+    if cols.seven {
+        v.push(Span::styled(
+            if cols.window_name { " 7d " } else { " " },
+            dim(),
+        ));
+        v.push(compact_pct(seven));
+        if cols.seven_reset
+            && let Some(t) = seven.and_then(|w| w.resets_at)
+        {
+            v.push(Span::styled(
+                format!(" ↻{}", fmt_duration(t - model.now)),
+                dim(),
+            ));
+        }
+    }
+    v
 }
 
 fn compact_line(model: &DockModel, cols: CompactCols) -> Line<'static> {
@@ -644,13 +678,15 @@ fn compact_line(model: &DockModel, cols: CompactCols) -> Line<'static> {
         if cols.labels {
             spans.push(Span::styled(format!(" {} ", a.label), label_style(a, i)));
         }
-        if cols.window_name {
-            spans.push(Span::styled(" 5h ", dim()));
-        } else if cols.labels {
+        if cols.labels || cols.window_name {
             spans.push(Span::raw(" "));
         }
-        spans.push(compact_pct(
-            a.usage.as_ref().and_then(|u| u.five_hour.as_ref()),
+        let u = a.usage.as_ref();
+        spans.extend(compact_windows(
+            model,
+            u.and_then(|u| u.five_hour.as_ref()),
+            u.and_then(|u| u.seven_day.as_ref()),
+            cols,
         ));
         if a.next_pick {
             spans.push(Span::raw(format!(" {}", glyphs(model).next)));
@@ -662,11 +698,13 @@ fn compact_line(model: &DockModel, cols: CompactCols) -> Line<'static> {
             glyphs(model).pool,
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(
-            if cols.window_name { " 5h " } else { " " },
-            dim(),
+        spans.push(Span::raw(" "));
+        spans.extend(compact_windows(
+            model,
+            pool_five(model).0.as_ref(),
+            pool_seven(model).0.as_ref(),
+            cols,
         ));
-        spans.push(compact_pct(pool_five(model).0.as_ref()));
     }
     spans.push(Span::styled(" │ ", dim()));
     if let Some(c) = &model.countdown {
@@ -691,26 +729,41 @@ fn compact_line(model: &DockModel, cols: CompactCols) -> Line<'static> {
 }
 
 fn render_compact(model: &DockModel, area: Rect, buf: &mut Buffer) {
+    // Narrow terminals drop the 7d reset, then the 7d window, then the
+    // window names, then the pool, then the labels.
     let all = CompactCols {
+        seven: true,
+        seven_reset: true,
         window_name: true,
         pool: true,
         labels: true,
     };
+    let five_only = CompactCols {
+        seven: false,
+        seven_reset: false,
+        ..all
+    };
     let candidates = [
         all,
         CompactCols {
-            window_name: false,
+            seven_reset: false,
             ..all
+        },
+        five_only,
+        CompactCols {
+            window_name: false,
+            ..five_only
         },
         CompactCols {
             window_name: false,
             pool: false,
-            labels: true,
+            ..five_only
         },
         CompactCols {
             window_name: false,
             pool: false,
             labels: false,
+            ..five_only
         },
     ];
     let w = area.width as usize;
@@ -1012,13 +1065,30 @@ mod tests {
     fn compact_widths() {
         let r = draw(&model(DockMode::Compact), 120, 1);
         assert!(
+            r[0].contains(
+                "●  Acme Al  5h 48% 7d 31% ↻3d4h │ ○  Acme Bea  5h 1% 7d 72% ↻3d4h ▸ \
+                 │ Σ 5h 24% 7d 52% ↻3d4h │ ⌃\\"
+            ),
+            "{}",
+            r[0]
+        );
+        // Narrow terminals drop the 7d reset, then the 7d window, then the
+        // window name, then the pool, then labels, keeping the menu key visible.
+        let r = draw(&model(DockMode::Compact), 85, 1);
+        assert!(
+            r[0].contains(
+                "●  Acme Al  5h 48% 7d 31% │ ○  Acme Bea  5h 1% 7d 72% ▸ │ Σ 5h 24% 7d 52% │ ⌃\\"
+            ),
+            "{}",
+            r[0]
+        );
+        let r = draw(&model(DockMode::Compact), 70, 1);
+        assert!(
             r[0].contains("●  Acme Al  5h 48% │ ○  Acme Bea  5h 1% ▸ │ Σ 5h 24% │ ⌃\\"),
             "{}",
             r[0]
         );
         assert!(!r[0].contains("7d"), "{}", r[0]);
-        // Narrow terminals drop the window name, then the pool, then labels,
-        // keeping the menu key visible.
         let r = draw(&model(DockMode::Compact), 50, 1);
         assert!(
             r[0].contains("●  Acme Al  48% │ ○  Acme Bea  1% ▸ │ Σ 24% │ ⌃\\"),
