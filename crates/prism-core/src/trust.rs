@@ -3,7 +3,8 @@
 //! Claude keeps "trust this folder" per account, in `.claude.json` at
 //! `projects["<abs path>"].hasTrustDialogAccepted`. Before Claude starts on
 //! an account, [`sync`] adds the trust of every folder that another Claude
-//! account trusts. It only adds trust; it never removes it.
+//! account trusts. It only adds trust; it never removes it, and it never
+//! spreads `/`, the home dir or a folder between them ([`too_broad`]).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -109,8 +110,16 @@ fn read(path: &Path) -> Option<Value> {
     }
 }
 
+/// Whether trusting `folder` trusts the home dir: `/`, the home dir or a
+/// folder between them. Sync never spreads these. Claude never saves trust
+/// for the home dir itself (it trusts it one session at a time), and a
+/// trusted `/` turns the dialog off in every folder outside a git repo.
+pub fn too_broad(folder: &str, home: &Path) -> bool {
+    home.starts_with(folder)
+}
+
 /// The folders that the Claude accounts in `profiles` trust, not counting
-/// the file `skip`.
+/// the file `skip` or folders that are [`too_broad`].
 fn union(paths: &Paths, profiles: &[Profile], skip: &Path) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut all = BTreeSet::new();
@@ -120,30 +129,95 @@ fn union(paths: &Paths, profiles: &[Profile], skip: &Path) -> BTreeSet<String> {
             continue;
         }
         if let Some(v) = read(&file) {
-            all.extend(trusted(&v));
+            all.extend(
+                trusted(&v)
+                    .into_iter()
+                    .filter(|f| !too_broad(f, &paths.home)),
+            );
         }
     }
     all
 }
 
-/// Whether `trusted` covers `dir`: the folder itself or a parent of it, but
-/// no parent above `root` (Claude looks only up to the git repo root).
-pub fn covers(trusted: &BTreeSet<String>, dir: &Path, root: Option<&Path>) -> bool {
+/// The [`too_broad`] folders that the Claude account `profile` trusts (for
+/// `doctor`).
+pub fn broad(paths: &Paths, profile: &Profile) -> Vec<String> {
+    read(&profile.claude_json_path(paths))
+        .map(|v| {
+            trusted(&v)
+                .into_iter()
+                .filter(|f| too_broad(f, &paths.home))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How far an account's trust reaches into a folder. Claude 2.1.330 checks
+/// trust twice, and the two checks differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Nothing trusted covers the folder: Claude shows the trust dialog.
+    Untrusted,
+    /// A trusted folder above the key folder (see [`Coverage::Full`]):
+    /// Claude skips the dialog but still ignores the folder's project
+    /// settings (`.claude/settings*.json` permission rules and extra dirs).
+    ParentOnly,
+    /// The key folder is trusted: the git repo root, or the folder itself
+    /// outside a repo. Claude skips the dialog and reads the project
+    /// settings.
+    Full,
+}
+
+/// How far `trusted` reaches into `dir`, whose git repo root is `root`. The
+/// dialog counts the folder or a parent of it, but no parent above `root`;
+/// the project settings count only the key folder (`root`, else `dir`).
+pub fn coverage(trusted: &BTreeSet<String>, dir: &Path, root: Option<&Path>) -> Coverage {
+    if trusted.contains(root.unwrap_or(dir).to_string_lossy().as_ref()) {
+        return Coverage::Full;
+    }
     for d in dir.ancestors() {
         if trusted.contains(d.to_string_lossy().as_ref()) {
-            return true;
+            return Coverage::ParentOnly;
         }
         if Some(d) == root {
             break;
         }
     }
-    false
+    Coverage::Untrusted
 }
 
-/// Whether the Claude account `profile` trusts `dir` (see [`covers`]).
+/// Whether `trusted` covers `dir` enough to skip the dialog (see
+/// [`coverage`]).
+pub fn covers(trusted: &BTreeSet<String>, dir: &Path, root: Option<&Path>) -> bool {
+    coverage(trusted, dir, root) != Coverage::Untrusted
+}
+
+/// How far the Claude account `profile` trusts `dir` (see [`coverage`]).
 /// A missing or unreadable `.claude.json` trusts nothing.
+pub fn coverage_for(paths: &Paths, profile: &Profile, dir: &Path, root: Option<&Path>) -> Coverage {
+    read(&profile.claude_json_path(paths))
+        .map_or(Coverage::Untrusted, |v| coverage(&trusted(&v), dir, root))
+}
+
+/// Whether the Claude account `profile` trusts `dir` enough to skip the
+/// dialog (see [`coverage`]).
 pub fn trusts(paths: &Paths, profile: &Profile, dir: &Path, root: Option<&Path>) -> bool {
-    read(&profile.claude_json_path(paths)).is_some_and(|v| covers(&trusted(&v), dir, root))
+    coverage_for(paths, profile, dir, root) != Coverage::Untrusted
+}
+
+/// The git toplevel of `dir`: Claude counts a trusted parent only up to it,
+/// and keys a repo's project settings on it.
+pub fn repo_root(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
 /// How many folders `target` trusts, and how many that other accounts in
@@ -321,6 +395,68 @@ mod tests {
             &serde_json::json!({"projects": {"/w": {TRUST_KEY: true}}}),
         );
         assert!(trusts(&paths, &ps[0], Path::new("/w/x"), None));
+    }
+
+    #[test]
+    fn coverage_tells_the_key_folder_from_a_parent() {
+        let t = folders(&["/", "/r", "/w/sub"]);
+        // Outside a repo the key folder is the folder itself.
+        assert_eq!(coverage(&t, Path::new("/r"), None), Coverage::Full);
+        assert_eq!(
+            coverage(&t, Path::new("/home/u"), None),
+            Coverage::ParentOnly
+        );
+        assert_eq!(coverage(&t, Path::new("/r/x"), None), Coverage::ParentOnly);
+        // Inside a repo it is the repo root, wherever the folder is.
+        assert_eq!(
+            coverage(&t, Path::new("/r/a/b"), Some(Path::new("/r"))),
+            Coverage::Full
+        );
+        assert_eq!(
+            coverage(&t, Path::new("/w/sub/x"), Some(Path::new("/w"))),
+            Coverage::ParentOnly
+        );
+        // `/` is above the repo root, so it does not count there.
+        assert_eq!(
+            coverage(&t, Path::new("/q/x"), Some(Path::new("/q"))),
+            Coverage::Untrusted
+        );
+        assert!(!covers(&t, Path::new("/q/x"), Some(Path::new("/q"))));
+        assert!(covers(&t, Path::new("/home/u"), None));
+    }
+
+    #[test]
+    fn too_broad_is_home_and_above() {
+        let home = Path::new("/Users/u");
+        for f in ["/", "/Users", "/Users/u", "/Users/u/"] {
+            assert!(too_broad(f, home), "{f}");
+        }
+        for f in ["/Users/u/w", "/Users/uu", "/Use", "/tmp"] {
+            assert!(!too_broad(f, home), "{f}");
+        }
+    }
+
+    #[test]
+    fn sync_never_spreads_broad_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, ps) = set(&[("a", false), ("b", false)], dir.path());
+        let home = paths.home.to_string_lossy().to_string();
+        let work = format!("{home}/w");
+        write(
+            &ps[0],
+            &paths,
+            &serde_json::json!({ "projects": {
+                "/": { TRUST_KEY: true },
+                home.clone(): { TRUST_KEY: true },
+                work.clone(): { TRUST_KEY: true }
+            }}),
+        );
+        write(&ps[1], &paths, &serde_json::json!({ "projects": {} }));
+        assert_eq!(status(&paths, &ps[1], &ps), Some((0, 1)));
+        assert_eq!(sync(&paths, &ps[1], &ps), 1);
+        assert_eq!(trusted(&load(&ps[1], &paths)), folders(&[&work]));
+        assert_eq!(broad(&paths, &ps[0]), vec!["/".to_string(), home]);
+        assert!(broad(&paths, &ps[1]).is_empty());
     }
 
     #[test]

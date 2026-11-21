@@ -281,15 +281,31 @@ start-up environment from `environ`, own uid only). A claude with no
 
 Claude keeps "trust this folder" in the account's `.claude.json` (§4.1), at
 `projects["<abs path>"].hasTrustDialogAccepted`; no other field marks trust.
-Claude also counts a trusted parent dir; inside a git repo it looks only up
-to the repo root (Claude 2.1.310). Codex keeps trust in `config.toml`
+Claude checks trust twice, and the two checks differ (Claude 2.1.330):
+
+- The dialog counts the folder or a trusted parent dir; inside a git repo it
+  looks only up to the repo root. A trusted parent means no dialog.
+- Project settings (`.claude/settings*.json` permission rules and
+  `additionalDirectories`) count only the key folder: the repo root inside a
+  git repo, else the folder itself. With only a parent trusted, Claude skips
+  the dialog yet ignores those settings and warns "this workspace has not
+  been trusted".
+- Claude never saves trust for the home dir: accepting the dialog there
+  trusts it for that run only. So `claude` in `~` with `/` trusted shows no
+  dialog and always drops `~/.claude/settings.json` as project settings.
+
+`prism_core::trust::coverage` models this (`Full`, `ParentOnly`,
+`Untrusted`); `doctor` shows it for the current folder. Codex keeps trust in `config.toml`
 (`[projects."<path>"] trust_level`), which all Codex accounts share (§12), so
 it needs nothing.
 
 Before Claude starts on an account (first start and every switch; not print
 mode, which shows no dialog), `prism_core::trust::sync` gives that account
 the trust of every folder that another Claude account trusts (the union).
-It only adds trust; it never removes it.
+It only adds trust; it never removes it. It never spreads `/`, the home dir
+or a folder between them (`too_broad`): a trusted `/` turns the dialog off in
+every folder outside a git repo, and Claude itself never saves home-dir
+trust. `doctor` flags an account that trusts one of them.
 
 - Existing entry: only `hasTrustDialogAccepted` becomes `true`; its other
   fields stay. No entry: Claude's own default entry (`allowedTools: []`,

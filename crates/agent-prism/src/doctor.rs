@@ -54,6 +54,8 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
     platform_lines(has_codex, &mut tips);
     let now = unix_now();
     let claude = config.profiles_for(&ctx.paths, Tool::Claude);
+    let here = std::env::current_dir().ok();
+    let here_root = here.as_deref().and_then(prism_core::trust::repo_root);
     for p in profiles {
         let common = &p.common_home;
         let rules = config.share_rules(p.tool);
@@ -105,6 +107,37 @@ pub fn run(ctx: Arc<AppCtx>) -> Result<i32> {
                             ""
                         }
                     );
+                }
+                if let Some(dir) = &here {
+                    use prism_core::trust::Coverage;
+                    let c =
+                        prism_core::trust::coverage_for(&ctx.paths, &p, dir, here_root.as_deref());
+                    println!(
+                        "  here     {}: {}",
+                        dir.display(),
+                        match c {
+                            Coverage::Full => "trusted",
+                            Coverage::ParentOnly =>
+                                "a parent only (no dialog, project settings ignored)",
+                            Coverage::Untrusted => "not trusted (Claude asks)",
+                        }
+                    );
+                }
+                let broad = prism_core::trust::broad(&ctx.paths, &p);
+                if !broad.is_empty() {
+                    let keys: Vec<String> = broad
+                        .iter()
+                        .map(|f| format!("projects[{f:?}].hasTrustDialogAccepted"))
+                        .collect();
+                    tips.push(format!(
+                        "{}: trusts {}, which turns Claude's trust dialog off in every folder \
+                         below it outside a git repo (sync no longer spreads it); set {} to \
+                         false in {}",
+                        p.id,
+                        broad.join(", "),
+                        keys.join(" and "),
+                        p.claude_json_path(&ctx.paths).display()
+                    ));
                 }
             }
             Tool::Codex => {

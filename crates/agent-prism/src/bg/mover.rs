@@ -176,20 +176,6 @@ pub fn shares_projects(a: &Profile, b: &Profile) -> bool {
     matches!((real(a), real(b)), (Some(x), Some(y)) if x == y)
 }
 
-/// The git toplevel of `dir`: Claude counts a trusted parent only up to it.
-fn repo_root(dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then(|| PathBuf::from(s))
-}
-
 /// Whether `target` trusts `cwd`, after giving it the other accounts'
 /// trust (`share.sync_trust`, §4.7). A background session can't answer
 /// the trust dialog.
@@ -197,7 +183,8 @@ pub fn trusted(env: &Env, target: &Profile, cwd: &Path) -> bool {
     if env.config.share.sync_trust {
         prism_core::trust::sync(&env.app.paths, target, &env.profiles);
     }
-    prism_core::trust::trusts(&env.app.paths, target, cwd, repo_root(cwd).as_deref())
+    let root = prism_core::trust::repo_root(cwd);
+    prism_core::trust::trusts(&env.app.paths, target, cwd, root.as_deref())
 }
 
 /// Claims `p` for the session `s` this process moves (DESIGN §6.6):
