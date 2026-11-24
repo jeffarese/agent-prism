@@ -336,6 +336,11 @@ how many folders it trusts and how many only other accounts trust.
 The dock, the balancer and the settings UI use these types (already in the
 skeleton). Times are unix seconds (`i64`). Percentages are `f64` 0–100.
 
+`build_views` returns the `AccountView`s in display order: by weekly reset,
+the one that comes first on top, and accounts without a coming weekly reset
+last, in config order. A view without a config color carries the color of
+its account's place in the config, so the order never changes a color.
+
 ## 6. Usage (`prism-usage`)
 
 ### 6.1 Token

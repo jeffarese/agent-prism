@@ -1200,6 +1200,10 @@ mod tests {
     fn colors() {
         assert_eq!(account_color(Some("magenta"), 0), Color::Magenta);
         assert_eq!(account_color(Some("nope"), 1), account_color(None, 1));
+        // The names a view carries for an account without a config color.
+        for (i, name) in prism_core::model::ACCOUNT_COLORS.iter().enumerate() {
+            assert_eq!(account_color(Some(name), 99), account_color(None, i));
+        }
     }
 
     #[test]

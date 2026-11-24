@@ -400,6 +400,11 @@ as usual.
   </tr>
 </table>
 
+The dock, the switch menu, `agp status` and the dashboard list the accounts
+by weekly reset: the account whose weekly window resets first is on top.
+Accounts without a coming weekly reset are last, in config order. An
+account keeps its color when its place changes.
+
 ## How it works
 
 - Each account is a Claude config dir (`~/.claude-<id>`). Shared parts

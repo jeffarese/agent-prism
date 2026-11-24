@@ -711,7 +711,7 @@
     const LW = W < 520 ? 76 : 120, MR = 10, TOP = 6, XB = 22, BAR = 12, PITCH = 16, PAD = 8;
     const since = a.since, now = a.now;
     const x = (t) => LW + ((Math.max(since, Math.min(now, t)) - since) / (now - since)) * (W - LW - MR);
-    // Lanes: the accounts in config order, then any others the journal names.
+    // Lanes: the accounts in the order of the list, then any others the journal names.
     const laneIds = visibleAccounts().map((x1) => x1.id);
     for (const r of runs) for (const sg of r.segments) if (!laneIds.includes(sg.profile)) laneIds.push(sg.profile);
     const lanes = new Map(laneIds.map((id) => [id, { id, rows: [], items: [] }]));

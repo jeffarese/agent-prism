@@ -182,12 +182,17 @@ pub struct Limited {
     pub until: Option<i64>,
 }
 
+/// The colors of accounts without a config color, by position in the
+/// config. The dock's palette is in the same order.
+pub const ACCOUNT_COLORS: [&str; 6] = ["cyan", "magenta", "blue", "green", "yellow", "red"];
+
 /// Everything the dock and the balancer need to know about one account.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccountView {
     pub profile_id: ProfileId,
     pub label: String,
-    /// A color name from the config ("cyan", "magenta", ...), if set.
+    /// A color name ("cyan", "magenta", ...): the one from the config, or
+    /// the one of the account's position there ([`ACCOUNT_COLORS`]).
     pub color: Option<String>,
     pub identity: AccountIdentity,
     pub token: TokenState,

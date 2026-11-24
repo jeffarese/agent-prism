@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use prism_core::model::{
-    AccountIdentity, AccountView, LimitKind, Projection, TokenState, UsageStatus,
+    ACCOUNT_COLORS, AccountIdentity, AccountView, LimitKind, Projection, TokenState, UsageStatus,
 };
 
 use crate::balance::{self, BalanceSettings, fmt_duration};
@@ -84,8 +84,23 @@ fn status(cached: Option<&CachedUsage>, ctx: &ViewCtx) -> UsageStatus {
     }
 }
 
-/// Builds one view per input, in input order, with limits, scores, reasons
-/// and the next pick marked.
+/// When the weekly window of `v` resets, if that is known and still ahead.
+fn reset_7d(v: &AccountView, now: i64) -> Option<i64> {
+    v.usage
+        .as_ref()?
+        .seven_day
+        .as_ref()?
+        .resets_at
+        .filter(|t| *t > now)
+}
+
+/// Builds one view per input, with limits, scores, reasons and the next
+/// pick marked.
+///
+/// The views are in display order: the account whose weekly window resets
+/// first comes first, and accounts without a coming weekly reset follow in
+/// input order. An account without a config color gets the color of its
+/// input position, so a color stays with its account when the order changes.
 pub fn build_views(
     inputs: &[AccountInput],
     usage: &HashMap<String, CachedUsage>,
@@ -97,10 +112,11 @@ pub fn build_views(
         .map(|i| balance::assess(i, usage.get(&i.profile_id), ctx))
         .collect();
     let pick = balance::pick_assessed(inputs, &assessed, ctx);
-    inputs
+    let mut views: Vec<AccountView> = inputs
         .iter()
         .zip(assessed)
-        .map(|(i, a)| {
+        .enumerate()
+        .map(|(n, (i, a))| {
             let cached = usage.get(&i.profile_id);
             let chosen = pick.chosen.as_deref() == Some(i.profile_id.as_str());
             let score = (a.eligible && a.limited.is_none())
@@ -128,7 +144,10 @@ pub fn build_views(
             AccountView {
                 profile_id: i.profile_id.clone(),
                 label: i.label.clone(),
-                color: i.color.clone(),
+                color: i
+                    .color
+                    .clone()
+                    .or_else(|| Some(ACCOUNT_COLORS[n % ACCOUNT_COLORS.len()].into())),
                 identity: i.identity.clone(),
                 token: i.token.clone(),
                 usage_status: status(cached, ctx),
@@ -143,7 +162,13 @@ pub fn build_views(
                 reason,
             }
         })
-        .collect()
+        .collect();
+    // Stable: accounts with the same key keep their input order.
+    views.sort_by_key(|v| {
+        let t = reset_7d(v, ctx.now);
+        (t.is_none(), t)
+    });
+    views
 }
 
 #[cfg(test)]
@@ -220,6 +245,42 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn views_are_ordered_by_weekly_reset() {
+        let c = ctx(Policy::Smart);
+        let now = c.now;
+        let day = 86_400;
+        let mut e = input("e");
+        e.color = Some("white".into());
+        let u = HashMap::from([
+            usage("a", 0.0, 10.0, Some(now + 5 * day), now),
+            // No weekly reset known, and one that has passed.
+            usage("b", 0.0, 10.0, None, now),
+            usage("c", 0.0, 10.0, Some(now - 60), now),
+            usage("d", 0.0, 10.0, Some(now + day), now),
+            usage("e", 0.0, 10.0, Some(now + 3 * day), now),
+            // "f" has no usage at all.
+        ]);
+        let v = build_views(
+            &[
+                input("a"),
+                input("b"),
+                input("c"),
+                input("d"),
+                e,
+                input("f"),
+            ],
+            &u,
+            &HashMap::new(),
+            &c,
+        );
+        let ids: Vec<&str> = v.iter().map(|v| v.profile_id.as_str()).collect();
+        assert_eq!(ids, ["d", "e", "a", "b", "c", "f"]);
+        // Colors follow the account's place in the config, not in the list.
+        let colors: Vec<&str> = v.iter().filter_map(|v| v.color.as_deref()).collect();
+        assert_eq!(colors, ["green", "white", "cyan", "magenta", "blue", "red"]);
     }
 
     #[test]

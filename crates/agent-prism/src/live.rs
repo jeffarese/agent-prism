@@ -37,7 +37,8 @@ pub struct PendingSwitch {
 #[derive(Clone, Debug, Default)]
 pub struct LiveData {
     pub config: Config,
-    /// One view per configured profile, in config order.
+    /// One view per configured profile, in display order (the weekly reset
+    /// that comes first is first).
     pub views: Vec<AccountView>,
     /// The balancer's pick for a new session (or the switch target).
     pub pick: Option<PickResult>,
