@@ -15,6 +15,12 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 const BAR_CELLS: usize = 15;
+/// Widths of the history chart, the widest first: 24 hours in cells of 30
+/// minutes, 1 hour or 2 hours.
+const CHART_CELLS: [usize; 3] = [48, 24, 12];
+/// Empty columns between the account rows and the chart.
+const CHART_GAP: usize = 3;
+const SPARK: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 const PALETTE: [Color; 6] = [
     Color::Cyan,
     Color::Magenta,
@@ -508,6 +514,148 @@ fn line_width(l: &Line<'_>) -> usize {
     l.spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// `hist` folded into `cells` cells of equal length: the peak of each.
+fn fold(hist: &[Option<f64>], cells: usize) -> Vec<Option<f64>> {
+    (0..cells)
+        .map(|j| {
+            let (a, b) = (j * hist.len() / cells, (j + 1) * hist.len() / cells);
+            hist.get(a..b)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .reduce(f64::max)
+        })
+        .collect()
+}
+
+/// One row of the chart: a bar per cell, and a space where nothing was
+/// sampled.
+fn spark(cells: &[Option<f64>], style: Style) -> Line<'static> {
+    let s: String = cells
+        .iter()
+        .map(|c| match c {
+            Some(v) => SPARK[((v.clamp(0.0, 100.0) / 100.0 * 7.0).round() as usize).min(7)],
+            None => " ",
+        })
+        .collect();
+    Line::styled(s, style)
+}
+
+/// The pool's history: the use of the pool accounts sampled in each cell,
+/// weighted by plan capacity like the pool row.
+fn pool_history(model: &DockModel, cells: usize) -> Vec<Option<f64>> {
+    let (mut used, mut cap) = (vec![0.0; cells], vec![0.0; cells]);
+    for a in model.accounts.iter().filter(|a| a.in_pool) {
+        let Some(h) = model.history.get(&a.profile_id) else {
+            continue;
+        };
+        let c = a.identity.capacity();
+        for (j, v) in fold(h, cells).into_iter().enumerate() {
+            if let Some(v) = v {
+                used[j] += c * v;
+                cap[j] += c;
+            }
+        }
+    }
+    used.iter()
+        .zip(&cap)
+        .map(|(u, c)| (*c > 0.0).then(|| u / c))
+        .collect()
+}
+
+/// What is left in the pool now: "left 5h 78% (3.9 accounts) · 7d 47%
+/// (2.3)". The accounts are the pool's accounts with data for the window,
+/// each counted by its plan capacity.
+fn left_line(model: &DockModel) -> Option<Line<'static>> {
+    let count = |pick: fn(&prism_core::model::UsageSnapshot) -> bool| {
+        model
+            .accounts
+            .iter()
+            .filter(|a| a.in_pool && a.usage.as_ref().is_some_and(pick))
+            .count() as f64
+    };
+    let parts = [
+        ("5h", pool_five(model).0, count(|u| u.five_hour.is_some())),
+        ("7d", pool_seven(model).0, count(|u| u.seven_day.is_some())),
+    ];
+    let mut spans = vec![Span::styled("left", dim())];
+    for (name, w, n) in parts {
+        let Some(w) = w else { continue };
+        let left = (100.0 - w.utilization).clamp(0.0, 100.0);
+        let unit = if spans.len() == 1 { " accounts" } else { "" };
+        if spans.len() > 1 {
+            spans.push(Span::styled(" ·", dim()));
+        }
+        spans.push(Span::styled(format!(" {name} "), dim()));
+        spans.push(Span::raw(format!("{left:.0}%")));
+        spans.push(Span::styled(
+            format!(" ({:.1}{unit})", n * left / 100.0),
+            dim(),
+        ));
+    }
+    (spans.len() > 1).then(|| Line::from(spans))
+}
+
+/// The chart beside the account rows: where it starts and how many cells
+/// it has. `None` when there is no history or no room for it.
+fn chart_place(model: &DockModel, used: usize, right: usize) -> Option<(usize, usize)> {
+    if model.history.is_empty() {
+        return None;
+    }
+    let x = used + CHART_GAP;
+    let cells = CHART_CELLS.into_iter().find(|c| x + c <= right)?;
+    Some((x, cells))
+}
+
+/// Draws the chart: a row of 5h history per account and for the pool, the
+/// time scale on the separator, and what is left on the status row.
+fn render_chart(
+    model: &DockModel,
+    area: Rect,
+    buf: &mut Buffer,
+    (x, cells): (usize, usize),
+    status_w: usize,
+) {
+    let col = |c: usize| area.x + c as u16;
+    // The scale, on the separator.
+    let mut scale = vec![(x - 1, " -24h ".to_string())];
+    if cells >= 24 {
+        scale.push((x + (cells - 8) / 2, " 5h use ".to_string()));
+    }
+    scale.push((x + cells - 4, " now ".to_string()));
+    for (c, s) in scale {
+        buf.set_string(col(c), area.y, s, dim());
+    }
+    let rows = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = model
+        .accounts
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let h = model.history.get(&a.profile_id).map_or(&[][..], |h| h);
+            let style = Style::default().fg(account_color(a.color.as_deref(), i));
+            spark(&fold(h, cells), style)
+        })
+        .collect();
+    if has_pool_row(model) {
+        lines.push(spark(&pool_history(model, cells), Style::default()));
+    }
+    for (i, l) in lines.iter().take(rows).enumerate() {
+        buf.set_line(col(x), area.y + 1 + i as u16, l, cells as u16);
+    }
+    // What is left, under the chart, when the status text leaves room.
+    if area.height >= 2
+        && has_pool_row(model)
+        && let Some(l) = left_line(model)
+    {
+        let lw = line_width(&l);
+        if let Some(start) = (x + cells).checked_sub(lw).filter(|s| *s >= status_w + 2) {
+            buf.set_line(col(start), area.y + area.height - 1, &l, lw as u16);
+        }
+    }
+}
+
 fn render_full(model: &DockModel, area: Rect, buf: &mut Buffer) {
     let w = area.width as usize;
     // Separator.
@@ -586,8 +734,10 @@ fn render_full(model: &DockModel, area: Rect, buf: &mut Buffer) {
         v
     };
     let mut lines = Vec::new();
+    let mut widest = false;
     for (k, c) in candidates.iter().enumerate() {
         lines = build(*c);
+        widest = k == 0;
         if k == candidates.len() - 1 || lines.iter().all(|l| line_width(l) <= w) {
             break;
         }
@@ -596,13 +746,15 @@ fn render_full(model: &DockModel, area: Rect, buf: &mut Buffer) {
     for (i, l) in lines.iter().take(rows_for_accounts).enumerate() {
         buf.set_line(area.x, area.y + 1 + i as u16, l, area.width);
     }
+    let status = status_line(model, w);
     if area.height >= 2 {
-        buf.set_line(
-            area.x,
-            area.y + area.height - 1,
-            &status_line(model, w),
-            area.width,
-        );
+        buf.set_line(area.x, area.y + area.height - 1, &status, area.width);
+    }
+    // The chart takes the columns no row uses, left of the title, and only
+    // when every column of the rows is shown.
+    let used = lines.iter().map(line_width).max().unwrap_or(0);
+    if widest && let Some(place) = chart_place(model, used, w.saturating_sub(tw + 1)) {
+        render_chart(model, area, buf, place, line_width(&status));
     }
 }
 
@@ -1000,6 +1152,7 @@ mod tests {
             menu_key_label: "⌃\\".into(),
             show_projections: true,
             icons: DockIcons::Unicode,
+            history: Default::default(),
             now: 1000,
         }
     }
@@ -1023,6 +1176,85 @@ mod tests {
             assert!(l.width() <= w as usize, "overflow: {l}");
         }
         r
+    }
+
+    /// The test model with a history: Al rises over the day, Bea was
+    /// sampled only in its second half.
+    fn model_with_history() -> DockModel {
+        let mut m = model(DockMode::Full);
+        let al = (0..48).map(|i| Some(i as f64 * 100.0 / 47.0)).collect();
+        let bea = (0..48).map(|i| (i >= 24).then_some(50.0)).collect();
+        m.history = [("acme al".to_string(), al), ("acme bea".to_string(), bea)].into();
+        m
+    }
+
+    /// The cells of a chart row: they start under the "-24h" of the scale.
+    fn chart_cells(r: &[String], row: usize) -> String {
+        let x = r[0].find("-24h").expect("scale");
+        let x = r[0][..x].chars().count();
+        r[row].chars().skip(x).collect::<String>().trim_end().into()
+    }
+
+    #[test]
+    fn chart_on_a_wide_terminal() {
+        let m = model_with_history();
+        let r = draw(&m, 200, 5);
+        // The scale is on the separator, left of the title.
+        assert!(r[0].contains(" -24h ─") && r[0].contains("─ 5h use ─"));
+        assert!(r[0].contains("─ now ─"), "{}", r[0]);
+        assert!(r[0].ends_with("─ agent-prism · smart ─"), "{}", r[0]);
+        // 48 cells of half an hour, in the same columns on every row.
+        let al = chart_cells(&r, 1);
+        assert_eq!(al.chars().count(), 48);
+        assert!(al.starts_with("▁▁▁▁▂") && al.ends_with("▇████"), "{al}");
+        // Nothing was sampled for Bea in the first half of the day.
+        assert_eq!(r[2].matches('▅').count(), 24);
+        assert_eq!(
+            chart_cells(&r, 2),
+            format!("{}{}", " ".repeat(24), "▅".repeat(24))
+        );
+        // The pool: Al alone at first, then the mean of both.
+        let pool = chart_cells(&r, 3);
+        assert!(
+            pool.starts_with("▁▁▁▁▂") && pool.ends_with("▆▆▆▆"),
+            "{pool}"
+        );
+        // What is left, under the chart: 100 - (48 + 1) / 2 of the 5h
+        // windows and 100 - (31 + 72) / 2 of the weeks, of 2 accounts.
+        assert_eq!(
+            chart_cells(&r, 4).trim_start(),
+            "left 5h 76% (1.5 accounts) · 7d 48% (1.0)"
+        );
+        assert!(r[4].contains("usage 40s ago"), "{}", r[4]);
+    }
+
+    #[test]
+    fn chart_narrows_and_goes_with_the_width() {
+        let m = model_with_history();
+        // 24 cells of an hour.
+        let r = draw(&m, 170, 5);
+        assert!(r[0].contains("─ 5h use ─"), "{}", r[0]);
+        assert_eq!(chart_cells(&r, 1).chars().count(), 24);
+        assert_eq!(r[2].matches('▅').count(), 12);
+        // 12 cells of two hours: no room for the name of the scale.
+        let r = draw(&m, 160, 5);
+        assert!(r[0].contains(" -24h ─── now ─") && !r[0].contains("5h use"));
+        assert_eq!(chart_cells(&r, 1), "▁▂▃▃▄▄▅▆▆▇▇█");
+        // No room: the dock is as without a history.
+        assert_eq!(draw(&m, 150, 5), draw(&model(DockMode::Full), 150, 5));
+        // A long status text takes the row of what is left.
+        let mut m = m;
+        m.message = Some(StatusMessage {
+            level: MessageLevel::Warn,
+            text: "x".repeat(150),
+        });
+        let r = draw(&m, 200, 5);
+        assert!(!r[4].contains("left"), "{}", r[4]);
+        assert!(r[1].contains("▇████"), "{}", r[1]);
+        // Compact mode has no chart.
+        let mut m = model_with_history();
+        m.mode = DockMode::Compact;
+        assert!(!draw(&m, 200, 2).concat().contains("-24h"));
     }
 
     #[test]

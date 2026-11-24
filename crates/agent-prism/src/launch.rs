@@ -16,7 +16,7 @@ use prism_core::profile::Profile;
 use prism_core::registry;
 use prism_term::pty::ChildSpec;
 use prism_usage::balance::{self, BalanceSettings, PickResult};
-use prism_usage::cache::{CachedUsage, Sample, UsageCache};
+use prism_usage::cache::{CachedUsage, Sample, UsageCache, history_5h};
 use prism_usage::infer;
 use prism_usage::poller::{UreqFetcher, UsageFetcher};
 use prism_usage::tokens::TokenSource;
@@ -963,6 +963,21 @@ pub fn projections(
             let snap = c.snapshot.as_ref()?;
             let samples = cache.samples(id, now - infer::LOOKBACK_7D_SECS);
             Some((id.clone(), infer::project(&samples, snap, now)))
+        })
+        .collect()
+}
+
+/// The 5h use of each profile over the last 24 hours, for the dock's chart.
+pub fn history(
+    cache: &UsageCache,
+    profiles: &[Profile],
+    now: i64,
+) -> HashMap<String, Vec<Option<f64>>> {
+    profiles
+        .iter()
+        .map(|p| {
+            let samples = cache.samples(&p.id, now - 86_400);
+            (p.id.clone(), history_5h(&samples, now))
         })
         .collect()
 }

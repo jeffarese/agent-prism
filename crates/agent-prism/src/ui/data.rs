@@ -255,6 +255,7 @@ pub fn dock_model(
         menu_key_label: "⌃\\".into(),
         show_projections: config.dock.projections,
         icons: config.dock.icons,
+        history: HashMap::new(),
         now: now(),
     }
 }

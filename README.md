@@ -400,6 +400,11 @@ as usual.
   </tr>
 </table>
 
+On a wide terminal the full dock (`--dock full`) also draws a chart in the
+free columns at the right: the 5h use of each account and of the pool over
+the last 24 hours, and under it what is left in the pool now
+(`left 5h 78% (3.9 accounts) · 7d 47% (2.3)`).
+
 The dock, the switch menu, `agp status` and the dashboard list the accounts
 by weekly reset: the account whose weekly window resets first is on top.
 Accounts without a coming weekly reset are last, in config order. An

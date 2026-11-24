@@ -2,6 +2,8 @@
 //!
 //! Times are unix seconds. Percentages are `f64` in 0..=100.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub type ProfileId = String;
@@ -295,6 +297,11 @@ pub struct DockModel {
     pub menu_key_label: String,
     pub show_projections: bool,
     pub icons: DockIcons,
+    /// The 5h use of each account over the last 24 hours, oldest first, in
+    /// buckets of equal length (`None`: nothing was sampled). The full dock
+    /// draws it beside the accounts when the terminal is wide enough; an
+    /// empty map means no chart.
+    pub history: HashMap<ProfileId, Vec<Option<f64>>>,
     /// Current unix time, so rendering is deterministic in tests.
     pub now: i64,
 }

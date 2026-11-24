@@ -128,6 +128,8 @@ pub struct SessionHost {
     inputs: Vec<AccountInput>,
     usage: HashMap<String, CachedUsage>,
     projections: HashMap<String, Projection>,
+    /// The 5h use of the last 24 hours per profile, for the dock's chart.
+    history: HashMap<String, Vec<Option<f64>>>,
     builder: SpecBuilder,
     model: Option<String>,
     policy: Option<Policy>,
@@ -211,6 +213,7 @@ impl SessionHost {
             inputs: Vec::new(),
             usage: HashMap::new(),
             projections: HashMap::new(),
+            history: HashMap::new(),
             since: now,
             started_at: now,
             transcript: None,
@@ -278,7 +281,14 @@ impl SessionHost {
 
     fn reload_usage_from_disk(&mut self) {
         self.usage = launch::load_usage(&self.ctx.cache, &self.profiles);
-        self.projections = launch::projections(&self.ctx.cache, &self.usage, self.now());
+        self.load_samples();
+    }
+
+    /// Projections and the dock's history, from the usage samples on disk.
+    fn load_samples(&mut self) {
+        let now = self.now();
+        self.projections = launch::projections(&self.ctx.cache, &self.usage, now);
+        self.history = launch::history(&self.ctx.cache, &self.profiles, now);
     }
 
     fn view_ctx(&self, exclude: Option<String>) -> views::ViewCtx {
@@ -934,7 +944,7 @@ impl SessionHost {
     fn on_usage(&mut self, u: UsageUpdate, ctl: &mut Control<UiAction>) {
         let id = u.profile_id.clone();
         self.usage.insert(id.clone(), u.cached);
-        self.projections = launch::projections(&self.ctx.cache, &self.usage, self.now());
+        self.load_samples();
         if id == self.active {
             self.check_active_limit();
         }
@@ -1187,6 +1197,7 @@ impl Host<SessionEvent, UiAction> for SessionHost {
             menu_key_label: "⌃\\".into(),
             show_projections: self.config.dock.projections,
             icons: self.config.dock.icons,
+            history: self.history.clone(),
             now,
         }
     }

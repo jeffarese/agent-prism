@@ -12,6 +12,26 @@ use serde::{Deserialize, Serialize};
 /// Samples older than this are pruned.
 pub const SAMPLE_RETENTION_SECS: i64 = 7 * 24 * 3600;
 
+/// The buckets of [`history_5h`]: 24 hours in half hours.
+pub const HISTORY_BUCKETS: usize = 48;
+const HISTORY_BUCKET_SECS: i64 = 1800;
+
+/// The 5h utilization over the last 24 hours, oldest first: the peak
+/// sampled in each half hour of the clock (the last bucket is the running
+/// one), and `None` where nothing was sampled.
+pub fn history_5h(samples: &[Sample], now: i64) -> Vec<Option<f64>> {
+    let end = now - now.rem_euclid(HISTORY_BUCKET_SECS) + HISTORY_BUCKET_SECS;
+    let start = end - HISTORY_BUCKETS as i64 * HISTORY_BUCKET_SECS;
+    let mut out = vec![None; HISTORY_BUCKETS];
+    for s in samples.iter().filter(|s| s.ts >= start && s.ts <= now) {
+        let k = ((s.ts - start) / HISTORY_BUCKET_SECS) as usize;
+        if let (Some(v), Some(slot)) = (s.u5h, out.get_mut(k)) {
+            *slot = Some(slot.map_or(v, |x: f64| x.max(v)));
+        }
+    }
+    out
+}
+
 /// The cached usage state of one profile.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CachedUsage {
@@ -149,6 +169,37 @@ impl UsageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_in_half_hours() {
+        // Ten minutes after a full hour (1_800_000_000 is one): the running
+        // bucket has 20 minutes to go.
+        let now = 1_800_000_000 + 600;
+        let s = |ago: i64, u5h: Option<f64>| Sample {
+            ts: now - ago,
+            u5h,
+            u7d: Some(1.0),
+        };
+        let samples = [
+            // Older than the 24 hours of the history.
+            s(24 * 3600, Some(99.0)),
+            // The first bucket: the half hour that began 23.5 hours ago.
+            s(23 * 3600 + 1200, Some(7.0)),
+            // The peak of a bucket counts.
+            s(3 * 3600, Some(20.0)),
+            s(3 * 3600 - 60, Some(60.0)),
+            s(3 * 3600 - 120, Some(40.0)),
+            // A sample without a 5h window.
+            s(3600, None),
+            s(0, Some(5.0)),
+        ];
+        let h = history_5h(&samples, now);
+        assert_eq!(h.len(), HISTORY_BUCKETS);
+        assert_eq!(h[0], Some(7.0));
+        assert_eq!(h[41], Some(60.0));
+        assert_eq!(h[47], Some(5.0));
+        assert_eq!(h.iter().flatten().count(), 3);
+    }
 
     #[test]
     fn store_load_roundtrip() {

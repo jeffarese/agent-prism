@@ -155,6 +155,7 @@ impl Host<(), Act> for Demo {
             menu_key_label: String::new(),
             show_projections: true,
             icons: DockIcons::Unicode,
+            history: Default::default(),
             now: t,
         }
     }

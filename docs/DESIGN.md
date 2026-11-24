@@ -704,6 +704,17 @@ paste goes to the focused text field.
   times, tier, bars (keep percentages).
   The status row drops its trailing parts (usage age, account, session) to
   fit, and the countdown shortens to `→ Acme Bea in 4s · ⌃\ stay`.
+- Chart: when all columns fit and columns are left between the longest row
+  and the title, each account's row goes on with its 5h use over the last
+  24 hours, a bar per cell in the account's color (`▁▂▃▅▇█`, a space where
+  nothing was sampled), and the pool row with the pool's, weighted by plan
+  capacity. It has 48 cells of 30 minutes, else 24 or 12; the separator
+  carries the scale above it (`-24h ── 5h use ── now`). The status row
+  shows what is left under it, when its text leaves room:
+  `left 5h 78% (3.9 accounts) · 7d 47% (2.3)`: 100 minus the pool's use,
+  and that share of the pool's accounts. The history is the peak of the
+  usage samples in each half hour of the clock (`history_5h`), read again
+  with each usage update.
 - Compact shows the 5h window only:
   ` ● Acme Al 5h 48% │ ○ Acme Bea 5h 1% ▸ │ Σ 5h 24% │ ⌃\ `. Narrow terminals
   drop the `5h` names, then the pool, then the labels (` ● 48% │ ○ 1% ▸ │ ⌃\ `).
