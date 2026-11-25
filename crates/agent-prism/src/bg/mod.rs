@@ -153,11 +153,12 @@ impl Drop for LaunchClaim<'_> {
 /// A launched job counts as running this long before its state is known.
 const JUST_LAUNCHED_SECS: i64 = 120;
 
-/// The profile and weight of every background session agp knows that uses
-/// its account now: a watched (or `stay`) session whose job is working, or
+/// The profile, the weight and the time it came to its account (its launch
+/// or last move) of every background session agp knows that uses its
+/// account now: a watched (or `stay`) session whose job is working, or
 /// that was launched moments ago. Sessions agp is moving are counted by the
 /// mover's claim. Read-only, for the balancer (DESIGN §6.6).
-pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<(String, f64)> {
+pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<(String, f64, i64)> {
     let Ok(rd) = std::fs::read_dir(record::dir(paths)) else {
         return Vec::new();
     };
@@ -181,7 +182,8 @@ pub fn running(paths: &prism_core::paths::Paths, now: i64) -> Vec<(String, f64)>
                 None => now - r.created_at < JUST_LAUNCHED_SECS,
             } || background_work(&dir, &r, now);
             let weight = r.load.filter(|w| *w > 0.0).unwrap_or(1.0);
-            working.then_some((r.profile, weight))
+            let since = r.moves.last().map_or(r.created_at, |m| m.at);
+            working.then_some((r.profile, weight, since))
         })
         .collect()
 }
@@ -703,7 +705,10 @@ mod running_tests {
         std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
         std::fs::write(&t, "").unwrap();
         std::fs::write(&agent, "{}\n").unwrap();
-        assert_eq!(running(&paths, now), vec![("a".to_string(), 1.9)]);
+        assert_eq!(
+            running(&paths, now),
+            vec![("a".to_string(), 1.9, now - 3600)]
+        );
         record::update(&paths, sid, |r| {
             r.moves.push(record::Move {
                 at: now + 5,

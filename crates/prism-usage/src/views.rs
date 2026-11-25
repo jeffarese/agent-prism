@@ -6,7 +6,7 @@ use prism_core::model::{
     ACCOUNT_COLORS, AccountIdentity, AccountView, LimitKind, Projection, TokenState, UsageStatus,
 };
 
-use crate::balance::{self, BalanceSettings, fmt_duration};
+use crate::balance::{self, BalanceSettings, Tight, fmt_duration};
 use crate::cache::CachedUsage;
 
 /// One configured account, as the `agp` binary sees it.
@@ -28,9 +28,15 @@ pub struct AccountInput {
     /// Their weight for the balancer: a working run is 1, an idle
     /// interactive session a quarter.
     pub load: f64,
+    /// The part of `load` that `slope_5h` does not show yet: runs that
+    /// came to the account within the last hour, less as they age.
+    pub fresh: f64,
     /// The 5h burn rate in this account's usage samples of the last hour,
     /// percent per hour (all use, also from outside agent-prism).
     pub slope_5h: Option<f64>,
+    /// Points of the weekly window one point of the 5h window costs on
+    /// this account, from its samples; `None`: [`balance::WEEK_PER_5H`].
+    pub week_per_5h: Option<f64>,
     /// Learned percent of this account's 5h window one run uses per hour;
     /// `None`: `run_load` scaled by the plan.
     pub run_rate: Option<f64>,
@@ -138,8 +144,29 @@ pub fn build_views(
                 Some("not logged in".into())
             } else if !i.in_pool {
                 Some("not in pool".into())
-            } else {
+            } else if ctx.exclude.as_deref() == Some(i.profile_id.as_str()) {
                 None
+            } else {
+                // Why the run does not fit here (DESIGN §6.6): a forecast,
+                // so the words say "would", not "is".
+                a.tight(ctx.settings.soft_5h).map(|t| {
+                    let (what, until) = match t {
+                        Tight::FiveHour => {
+                            ("5h would fill within the hour".to_string(), a.reset_5h)
+                        }
+                        Tight::Week(w) => (
+                            format!(
+                                "under an hour of {} room",
+                                w.label.as_deref().unwrap_or("weekly")
+                            ),
+                            w.resets_at,
+                        ),
+                    };
+                    match until {
+                        Some(t) => format!("{what}, resets in {}", fmt_duration(t - ctx.now)),
+                        None => what,
+                    }
+                })
             };
             AccountView {
                 profile_id: i.profile_id.clone(),
@@ -190,7 +217,9 @@ pub(crate) mod tests {
             },
             sessions_elsewhere: 0,
             load: 0.0,
+            fresh: 0.0,
             slope_5h: None,
+            week_per_5h: None,
             run_rate: None,
             active_here: false,
             last_used: None,

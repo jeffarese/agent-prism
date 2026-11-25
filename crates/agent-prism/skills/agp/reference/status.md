@@ -52,7 +52,8 @@ A `~` before a percent means agp inferred it (a past reset means 0%).
 - `token` keeps its old shape (`Valid`, `Expired`, `Missing`). `Expired`
   is the `idle` state, not a logout.
 - `capacity`: how many more runs of each tool the pool can take now before
-  every account would reach its soft 5h mark.
+  no account has room for one: its soft 5h mark, or a weekly limit, would be
+  reached within the hour.
 - `pick` is the Claude pick; `picks` has one per tool. Times are unix
   seconds.
 

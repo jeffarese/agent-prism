@@ -451,6 +451,11 @@ it looked. So lanes that start together pick on the same fresh numbers.
   than 3 samples, under 10 min of span, or a newest sample older than 15
   min. It counts all use of the account, also from outside agent-prism
   (claude.ai, another machine).
+- Weekly cost of the 5h window (`infer::week_per_5h`): the summed rise of
+  the 7d samples over the summed rise of the 5h samples, between
+  neighbouring samples of the 7 days kept; none with less than one full 5h
+  window of use. The balancer turns expected 5h use into weekly use with it
+  (§6.6).
 
 ### 6.6 Balancer
 
@@ -516,9 +521,21 @@ to different accounts. `agp status` and `agp pick` don't take it.
 this plan, `%/h`):
 
 ```
-load_5h  = u5h + max(burn_rate, Σ weights of the other runs × r) × h
+burn     = burn_rate + Σ (weight × freshness) of the other runs × r
+           (no burn rate: Σ weights of the other runs × r)
+load_5h  = u5h + burn × h
 with_run = load_5h + w × r × h    (this run added, w its learned weight)
 ```
+
+`freshness = max(0, 1 − minutes on the account / 60)`, counted from the
+run's start or last move. The burn rate is the slope of the last hour of
+samples (§6.5): it shows a run in full once the run has been on the account
+for that hour, and until then the run counts by its weight, less as it
+ages. After the hour the account's measured use stands for the run: three
+sessions open for hours, mostly waiting for their user, are the 5%/h they
+measure, not three working runs. (Counted by weight they were 56%/h, which
+on 2026-11-25 kept an account whose week was about to expire out of every
+pick.) The runs `plan` and `capacity` place are new.
 
 `balance.run_load` (default 25, 0 turns all of this off) is 25% of a 5h
 window per working-run hour on a capacity-1.0 plan. One user's history
@@ -530,40 +547,101 @@ open sessions, not working runs, and would undercount lanes; the burn-rate
 term already adapts to what an account really uses. Per-session burn read
 from the transcripts (§11f) gives each new run its weight `w` instead.
 
+**Weekly load.** The same hour in weekly points, for every weekly window
+`W` that binds the run: the 7-day window and, when the model is known, the
+scoped windows of that model.
+
+```
+with_run_W = u_W + (burn + w × r) × k × h_W     h_W = min(1, hours to W's reset)
+```
+
+`k` is how many weekly points one 5h point costs on the account: the summed
+rises of both windows between neighbouring samples of the last 7 days
+(pairs over 30 minutes apart, or with a reset between them, are skipped; it
+needs one full 5h window of use), else 0.2. Max 5x and team accounts
+measure 0.15 to 0.17: a week is about six full 5h windows. So the week is
+the window that runs out, and the 5h window only limits the speed. All the
+account's expected use counts on a scoped window, also of runs that may use
+another model.
+
 - **Limited**: `u5h >= hard`, or `u7d >= 100 - reserve_7d`, or a scoped
   window for the session's model `>= hard`. Limited accounts are never
   picked. Measured use only (not `load_5h`).
-- **smart** score, highest wins:
+- **Fits**: a run fits an account when within the hour it brings no window
+  near its limit: `with_run < soft_5h`, and `with_run_W` under the use that
+  limits the account (`min(100 - reserve_7d, hard)` for the 7-day window,
+  `hard` for a scoped one) for every `W`. A run placed where it does not
+  fit is a limit switch within the hour, which reads the conversation again
+  without the prompt cache. An account the run does not fit says why in its
+  view's `reason`, which `agp status` and the switch list show: "5h would
+  fill within the hour, resets in 2m", "under an hour of weekly room,
+  resets in 3d0h", "under an hour of Fable room, resets in 4h".
+- **smart**: among the accounts the run fits (none: among all), the highest
+  score:
   ```
-  slack7 = max(0, 100 - reserve_7d - u7d) / 100
-  days   = max(0.25, hours_to_7d_reset / 24)       (unknown reset → 7)
-  score  = cap * weight * ( 0.45 * (1 - with_run/100)
-                          + 0.35 * min(1, slack7 / days)
-                          + 0.20 * (1 - u7d/100) )
-         - (with_run >= soft_5h ? 0.50 : 0)
+  unused_W  = max(0, 100 - reserve_7d - u7d) / 100   (scoped: (100 - u_W) / 100)
+  days_W    = max(0.25, hours_to_W's_reset / 24)     (unknown reset → 7)
+  urgency   = min over W of min(1, unused_W / days_W)
+  score  = cap * weight * ( 0.40 * urgency
+                          + 0.60 * (1 - with_run/100) )
+         - (the run does not fit ? 0.50 : 0)
          - (usage unknown ? 0.15 : 0)
   cap = 2.0 for "20x" tiers, 1.0 for "5x" and team, 0.4 for pro, else 1.0
   ```
-  Tie → least recently used. With `run_load = 0`, `with_run = u5h`.
-- **priority**: first eligible in config order whose `with_run` stays
-  under `soft_5h` (fill one, then spill); none → the first.
+  Usage is unknown without a snapshot, and with one over an hour old of an
+  account that agent-prism has run on since (a live run, or a start after
+  the snapshot): its week has been used by an amount nobody measured. An
+  unknown account has no urgency. An old snapshot of an account nothing
+  ran on still stands, so an account with an idle login is picked as
+  before.
+  `urgency` is how fast the account's week must be used for none of it to
+  expire (1: all of it within a day), taken from the window that leaves the
+  run the least to use up. What an account has not used by its weekly reset
+  is lost, and the week is the window that runs out, so a run goes where
+  the quota it uses would expire first: a week that resets in 4 hours with
+  26% unused comes before one with 59% unused and three days left, unless
+  the other account has about half a 5h window more room. The 5h room
+  spreads runs between accounts whose weeks are alike, and decides when no
+  week is about to expire. Tie → least recently used. With `run_load = 0`,
+  `with_run = u5h` and a run fits any account that is not limited.
+
+  The weights are measured, not derived. More weight on the week puts a
+  day's runs on one account, which fills its 5h window. A simulation with
+  the real `pick` (5 accounts, 8 weeks, sessions that work part of the
+  time and lanes that work all of it) gave, against the score of before:
+  with 0.40, no more limit switches at a light or normal demand, and 1%
+  more work served with a sixth fewer switches when the demand exceeds the
+  pool; with 0.65, 2% more work served then, but one more 5h limit switch
+  a week at a normal demand. `cargo run --release -p prism-usage --example
+  balance_sim` runs it; run it before and after a change to the score.
+
+  Until 2026-11-25 the score was `0.45 * 5h room + 0.35 * urgency + 0.20 *
+  weekly room`. Its weekly-room term pulled away from the account whose
+  week was about to expire, and nothing kept a run off an account with a
+  few points of its week left.
+- **priority**: first eligible in config order that the run fits (fill
+  one, then spill); none → the first.
 - **round-robin**: fewest runs (summed weights), then least recently used.
 - **headroom**: max of `min(100 - with_run, 100 - reserve - u7d)`.
 - **Resume affinity**: a line that resumes a conversation starts on the
-  account that ran it last when that account is not limited and its
-  `with_run` stays under `soft_5h` (its prompt cache is there): Claude
+  account that ran it last when that account is not limited and the run
+  fits it (its prompt cache is there): Claude
   `--resume <uuid>` / `-r <uuid>` / `-c` (the last session agp ran in this
   folder), Codex `resume <id>` / `exec resume <id>` / `--last`. The account
   comes from the background record, else the journal (§11b). `--as` wins.
-- Every pick has a one-line reason, e.g. "weekly resets in 21h with 28%
-  unused", "most 5h room (40% left with this run)", "fewest runs now",
-  "resumes on the account that last ran it", "the only account not limited".
+- Every pick has a one-line reason. Smart names the term of the score that
+  put the pick ahead of the next best account: "weekly resets in 21h with
+  28% unused" ("Fable week resets in …" when the model's window binds) or
+  "most 5h room (40% left with this run)"; "the only account with room for
+  this run" when the run fits nowhere else. Others: "fewest runs now",
+  "resumes on the account that last ran it", "the only account not
+  limited".
 - All limited → no pick; report the earliest reset (label and profile id).
 - **Plan and capacity** (`agp pick --n`, `agp status`): `plan(n)` picks
   `n` times, each pick counting the ones before (nothing is claimed).
-  `capacity` is how many more working runs fit before every usable
-  account's `with_run` would reach `soft_5h`, each going to the account
-  with the most room (at most 50; `null` when `run_load = 0`).
+  `capacity` is how many more working runs fit before no usable account
+  has room for one, each going to the account with the most 5h room (at
+  most 50; `null` when `run_load = 0`).
 - Mid-session agent-prism never switches for balance alone — only on a limit or
   a manual switch (prompt cache is per account; a switch re-reads context).
 

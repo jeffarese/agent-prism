@@ -45,7 +45,7 @@ const POLICIES: [(Policy, &str, &str); 4] = [
     (
         Policy::Smart,
         "smart",
-        "weighs 5h room, weekly room, plan and weight",
+        "weighs 5h room and the week that expires first",
     ),
     (
         Policy::Priority,

@@ -118,6 +118,36 @@ pub fn rate_5h(samples: &[Sample], now: i64) -> Option<f64> {
     (now - newest <= RATE_FRESH_SECS).then_some(rate * 3600.0)
 }
 
+/// Samples further apart than this are not compared for [`week_per_5h`]:
+/// in a long gap a 5h window can reset and fill again unseen.
+const PAIR_MAX_GAP_SECS: i64 = 30 * 60;
+/// The 5h use [`week_per_5h`] needs to see, in points: one full window.
+const MIN_5H_POINTS: f64 = 100.0;
+
+/// How many points of the weekly window one point of the 5h window costs
+/// on this account (0.16: a full 5h window is 16% of the week), from the
+/// rises of both between neighbouring samples (oldest first). `None` when
+/// the samples show less than one full 5h window of use.
+pub fn week_per_5h(samples: &[Sample]) -> Option<f64> {
+    let (mut d5, mut d7) = (0.0, 0.0);
+    for p in samples.windows(2) {
+        if p[1].ts - p[0].ts > PAIR_MAX_GAP_SECS {
+            continue;
+        }
+        let (Some(a5), Some(b5), Some(a7), Some(b7)) = (p[0].u5h, p[1].u5h, p[0].u7d, p[1].u7d)
+        else {
+            continue;
+        };
+        // A fall is that window's reset.
+        if b5 < a5 || b7 < a7 {
+            continue;
+        }
+        d5 += b5 - a5;
+        d7 += b7 - a7;
+    }
+    (d5 >= MIN_5H_POINTS && d7 > 0.0).then(|| (d7 / d5).clamp(0.02, 1.0))
+}
+
 /// Projects utilization at the next reset of each window from recent
 /// samples. A window gets `None` when there is too little data or no known
 /// reset.
@@ -273,5 +303,34 @@ mod tests {
             rate_5h(&pts(&[(1800, 20.0), (1200, 19.5), (0, 19.2)]), now),
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn weekly_cost_of_the_5h_window() {
+        // Every 10 minutes the 5h window rises 5 points and the week 0.8,
+        // with a 5h reset every 16 samples.
+        let mut s: Vec<Sample> = (0..60)
+            .map(|i| Sample {
+                ts: i * 600,
+                u5h: Some((i % 16) as f64 * 5.0),
+                u7d: Some(i as f64 * 0.8),
+            })
+            .collect();
+        let k = week_per_5h(&s).unwrap();
+        assert!((k - 0.16).abs() < 1e-9, "{k}");
+        // Less than a full 5h window of use says nothing.
+        assert_eq!(week_per_5h(&s[..12]), None);
+        // A long gap is not compared: the 5h window may have reset in it.
+        for x in &mut s[30..] {
+            x.ts += 7200;
+            x.u7d = x.u7d.map(|u| u + 40.0);
+        }
+        let k = week_per_5h(&s).unwrap();
+        assert!((k - 0.16).abs() < 1e-9, "{k}");
+        // No weekly data.
+        for x in &mut s {
+            x.u7d = None;
+        }
+        assert_eq!(week_per_5h(&s), None);
     }
 }

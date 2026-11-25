@@ -462,6 +462,16 @@ pub fn account_line(v: &AccountView, index: usize, current: bool) -> Line<'stati
         ("○", Style::default().fg(color))
     };
     let (u5, u7) = usage_pcts(v);
+    // When the week resets: what is unused by then is lost, and that is
+    // what the balancer goes by (DESIGN §6.6).
+    let reset7 = v
+        .usage
+        .as_ref()
+        .and_then(|u| u.seven_day.as_ref())
+        .and_then(|w| w.resets_at)
+        .map_or_else(String::new, |r| {
+            format!("↻{}", prism_term::dock::fmt_duration(r - now()))
+        });
     let mut spans = vec![
         Span::styled(format!("{glyph} "), gstyle),
         Span::raw(t::fit(&v.label, 16)),
@@ -469,6 +479,7 @@ pub fn account_line(v: &AccountView, index: usize, current: bool) -> Line<'stati
         t::pct_span(u5),
         Span::styled("  7d ", t::dim()),
         t::pct_span(u7),
+        Span::styled(format!(" {reset7:<7}"), t::dim()),
     ];
     let note = if current {
         Some(("  current".to_string(), t::dim()))
@@ -483,6 +494,10 @@ pub fn account_line(v: &AccountView, index: usize, current: bool) -> Line<'stati
             },
             t::error(),
         ))
+    } else if let Some(why) = v.reason.as_ref().filter(|_| !v.next_pick) {
+        // Why the balancer passes it over ("5h would fill within the hour, resets in 2m");
+        // the pick's own reason is in the "Best" row.
+        Some((format!("  {why}"), t::warn()))
     } else {
         super::data::usage_note(v).map(|n| (format!("  {n}"), t::dim()))
     };
@@ -701,6 +716,36 @@ mod tests {
         ));
         m.handle_key(key(KeyCode::Esc));
         assert!(matches!(m.view, View::Main));
+    }
+
+    /// The rows say when each week resets and why the balancer passes an
+    /// account over; the pick's reason stays in the "Best" row.
+    #[test]
+    fn switch_rows_show_the_weekly_reset_and_the_verdict() {
+        let (_f, mut m) = menu();
+        {
+            let mut d = m.live.lock();
+            d.views.push(view("c", "Cy", 79.0, 5.0));
+            d.views[2].reason = Some("5h would fill within the hour, resets in 2m".into());
+            d.views[1].next_pick = true;
+            d.views[1].reason = Some("weekly resets in 2h0m with 28% unused".into());
+            d.pick.as_mut().unwrap().reason = "weekly resets in 2h0m with 28% unused".into();
+        }
+        m.handle_key(ch('w'));
+        let s = render(&mut m, 120, 40);
+        let row = |label: &str| {
+            s.lines()
+                .find(|l| l.contains(label) && l.contains("5h"))
+                .unwrap_or_else(|| panic!("{s}"))
+                .to_string()
+        };
+        assert!(s.contains("Best: Bob — weekly resets in 2h0m with 28% unused"));
+        assert!(row("Bob").contains("7d  72% ↻"), "{s}");
+        assert!(!row("Bob").contains("unused"), "{s}");
+        assert!(
+            row("Cy").contains("5h would fill within the hour, resets in 2m"),
+            "{s}"
+        );
     }
 
     /// A limited account can be chosen: to spend a limit reset there.

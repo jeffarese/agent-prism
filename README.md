@@ -159,16 +159,24 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
   sessions, `agp -p`, `agp codex exec`, supervised runs, `--bg` sessions,
   and runs pinned with `--as`. Picks are serialized (a file lock), so lanes
   that start together see each other.
-- A working run counts as `balance.run_load` (default 25) percent of the 5h
-  window per hour on a 5x/team plan (half that on 20x), on top of the
-  account's measured use and its burn rate over the last hour (which also
-  sees use from claude.ai or another machine). An interactive session that
-  waits for you counts a quarter, unless its subagents or a workflow it
-  started still work in the background. With accounts at 10%, 30% and 40%, three
-  lanes go a, b, a instead of a, a, a.
+- A working run that is new on its account counts as `balance.run_load`
+  (default 25) percent of the 5h window per hour on a 5x/team plan (half
+  that on 20x), on top of the account's measured use and its burn rate over
+  the last hour (which also sees use from claude.ai or another machine).
+  Over its first hour there the burn rate takes over: it shows what the run
+  really uses. An interactive session that waits for you counts a quarter,
+  unless its subagents or a workflow it started still work in the
+  background. With accounts at 10%, 30% and 40%, three lanes go a, b, a
+  instead of a, a, a.
+- A run goes where it fits: where, within the hour, it brings neither the
+  5h window near `soft_5h` nor a weekly window to its limit. Among those,
+  `smart` weighs the 5h room against the week that expires first: an
+  account whose week resets in 4 hours with 26% unused comes before one
+  with three days left, unless that one has about half a 5h window more
+  room.
 - `agp status --json` has `runs`, `load_5h` (expected 5h use one hour from
   now) and `usable` per account, and `capacity`: how many more runs fit
-  before every account nears `soft_5h`.
+  before no account has room for one.
 - Moves on a limit are spread the same way.
 - `agp learn` shows how much past sessions in the current repository burned,
   by kind of task (solo, with agents, workflow) and by effort, read from

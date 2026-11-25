@@ -232,7 +232,7 @@ fn print_table(o: &Out, color: bool) {
     }
     if let Some(n) = o.capacity {
         println!(
-            "room: {n} more run{} before every account nears its 5h limit",
+            "room: {n} more run{} before every account nears a limit",
             plural(n)
         );
     }

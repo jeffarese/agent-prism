@@ -31,28 +31,126 @@ pub struct PickResult {
     pub earliest_id: Option<String>,
 }
 
+/// Points of the weekly window one point of the 5h window costs, for an
+/// account whose samples don't say yet (`AccountInput::week_per_5h`): a
+/// full 5h window is a fifth of the week. Max 5x and team accounts measure
+/// 0.15 to 0.17.
+pub const WEEK_PER_5H: f64 = 0.2;
+
+/// Usage older than this says too little about an account that
+/// agent-prism has run on since: it counts as unknown.
+const UNKNOWN_AFTER_SECS: i64 = 3600;
+
+/// The smart score's weight of the week: how fast the account must be used
+/// for none of its week to expire. A week about to expire is worth about
+/// half a 5h window of room. More weight puts the runs of a day on one
+/// account: simulated (5 accounts, 8 weeks), 0.65 served 2% more work when
+/// the demand exceeded the pool, but at a normal demand cost a 5h limit
+/// switch a week that 0.40 does not.
+const WEEK_WEIGHT: f64 = 0.40;
+/// The smart score's weight of the 5h room left with this run.
+const ROOM_WEIGHT: f64 = 0.60;
+
+/// A weekly window that binds the run: the 7-day window, or a scoped
+/// window of the run's model.
+#[derive(Clone, Debug)]
+pub(crate) struct Week {
+    /// The scoped window's label ("Fable"); `None` for the 7-day window.
+    pub label: Option<String>,
+    /// Percent of the window the balancer may still use: what is unused,
+    /// less the reserve (7-day window only).
+    pub unused: f64,
+    pub resets_at: Option<i64>,
+    /// The use expected within the hour (or by the window's reset) with
+    /// this run on the account. Not clamped.
+    pub with_run: f64,
+    /// The use at which the account counts as limited.
+    pub limit: f64,
+}
+
+impl Week {
+    /// How fast the window must be used for none of it to expire:
+    /// `min(1, unused / days to its reset)`, 1 being all of it in a day.
+    pub fn urgency(&self, now: i64) -> f64 {
+        let days = self
+            .resets_at
+            .map(|r| ((r - now) as f64 / 86_400.0).max(0.25))
+            .unwrap_or(7.0);
+        (self.unused / 100.0 / days).min(1.0)
+    }
+}
+
+/// The window a run would bring near its limit within the hour.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Tight<'a> {
+    FiveHour,
+    Week(&'a Week),
+}
+
 /// Per-account facts the balancer derives from inputs and usage.
 #[derive(Clone, Debug)]
 pub(crate) struct Assessed {
     pub snapshot: Option<UsageSnapshot>,
-    pub u5h: f64,
+    /// The snapshot says what the account has used: there is one, and it
+    /// is not an old one of an account that runs have used since.
+    pub known: bool,
     pub u7d: f64,
-    pub reset_7d: Option<i64>,
+    pub reset_5h: Option<i64>,
     pub limited: Option<Limited>,
     /// In the pool with a usable token.
     pub eligible: bool,
     /// The 5h use expected within the hour (or by the window's reset) with
-    /// the runs on the account now: measured use plus the larger of the
-    /// recent burn rate and the runs' expected use. Not clamped.
+    /// the runs on the account now: measured use plus the recent burn rate
+    /// and what the runs too new to show in it are expected to use. Not
+    /// clamped.
     pub load_5h: f64,
     /// What one more run adds to `load_5h`.
     pub add_5h: f64,
+    /// The weekly windows that bind the run: the 7-day one, then the
+    /// scoped ones of its model. Never empty.
+    pub weeks: Vec<Week>,
 }
 
 impl Assessed {
     /// The expected 5h use with one more run on the account.
     pub fn with_run(&self) -> f64 {
         self.load_5h + self.add_5h
+    }
+
+    /// The weekly window that leaves the run the least to use up before
+    /// it expires, and its urgency: the account's.
+    pub fn week(&self, now: i64) -> (&Week, f64) {
+        self.weeks
+            .iter()
+            .map(|w| (w, w.urgency(now)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("the 7-day window is always there")
+    }
+
+    /// How fast the account must be used for none of its week to expire:
+    /// its binding week's urgency, and none while its usage is unknown
+    /// (nothing says that its week would go unused).
+    pub fn urgency(&self, now: i64) -> f64 {
+        if self.known { self.week(now).1 } else { 0.0 }
+    }
+
+    /// The window one more run would bring near its limit within the hour:
+    /// the 5h window at `soft_5h`, a weekly one at the use that limits the
+    /// account.
+    pub fn tight(&self, soft_5h: f64) -> Option<Tight<'_>> {
+        if self.with_run() >= soft_5h {
+            return Some(Tight::FiveHour);
+        }
+        self.weeks
+            .iter()
+            .find(|w| w.with_run >= w.limit)
+            .map(Tight::Week)
+    }
+
+    /// One more run fits: within the hour it brings no window near its
+    /// limit.
+    pub fn fits(&self, soft_5h: f64) -> bool {
+        self.tight(soft_5h).is_none()
     }
 }
 
@@ -79,10 +177,10 @@ pub fn model_matches(model: &str, label: &str) -> bool {
     !label.is_empty() && model.to_lowercase().contains(&label.to_lowercase())
 }
 
-/// The hours of new work the 5h window takes before it resets (at most
-/// one: the balancer looks one hour ahead).
-fn horizon_hours(reset_5h: Option<i64>, now: i64) -> f64 {
-    match reset_5h {
+/// The hours of new work a window takes before it resets (at most one: the
+/// balancer looks one hour ahead).
+fn horizon_hours(resets_at: Option<i64>, now: i64) -> f64 {
+    match resets_at {
         Some(r) if r > now => ((r - now) as f64 / 3600.0).min(1.0),
         _ => 1.0,
     }
@@ -109,6 +207,8 @@ pub(crate) fn assess(
         .and_then(|c| c.snapshot.as_ref())
         .map(|s| apply_inference(s, ctx.now));
     let hard = ctx.settings.hard;
+    let reserve = f64::from(input.reserve_7d);
+    let limit_7d = (100.0 - reserve).min(hard);
     let (mut u5h, mut u7d, mut reset_5h, mut reset_7d) = (0.0, 0.0, None, None);
     let mut limited = None;
     if let Some(s) = &snapshot {
@@ -123,7 +223,7 @@ pub(crate) fn assess(
                 kind: LimitKind::FiveHour,
                 until: reset_5h,
             });
-        } else if u7d >= (100.0 - f64::from(input.reserve_7d)).min(hard) {
+        } else if u7d >= limit_7d {
             limited = Some(Limited {
                 kind: LimitKind::SevenDay,
                 until: reset_7d,
@@ -155,52 +255,77 @@ pub(crate) fn assess(
         }
     }
     let eligible = input.in_pool && !matches!(input.token, TokenState::Missing);
-    let (load_5h, add_5h) = if ctx.run_load > 0.0 {
-        let h = horizon_hours(reset_5h, ctx.now);
+    let known = snapshot.as_ref().is_some_and(|s| {
+        let used_since = input.sessions_elsewhere > 0
+            || input.active_here
+            || input.last_used.is_some_and(|t| t > s.fetched_at);
+        !(used_since && ctx.now - s.fetched_at > UNKNOWN_AFTER_SECS)
+    });
+    // The 5h points per hour the runs on the account are expected to use,
+    // and what this run adds. The measured rate shows the runs that have
+    // been there for a while as they really are (an open session is idle
+    // most of the time); `fresh` adds the ones too new to show in it.
+    let (burn, add) = if ctx.run_load > 0.0 {
         let per_run = run_rate(input, ctx);
-        let claimed = input.load * per_run;
-        let burn = input.slope_5h.map_or(claimed, |s| s.max(claimed));
-        (u5h + burn * h, per_run * h * ctx.new_run.max(0.0))
+        let burn = match input.slope_5h {
+            Some(s) => s + input.fresh * per_run,
+            None => input.load * per_run,
+        };
+        (burn, per_run * ctx.new_run.max(0.0))
     } else {
-        (u5h, 0.0)
+        (0.0, 0.0)
     };
+    let h = horizon_hours(reset_5h, ctx.now);
+    let per_5h = input.week_per_5h.unwrap_or(WEEK_PER_5H);
+    let week = |label, used: f64, unused: f64, resets_at, limit| Week {
+        label,
+        unused: unused.max(0.0),
+        resets_at,
+        with_run: used + (burn + add) * per_5h * horizon_hours(resets_at, ctx.now),
+        limit,
+    };
+    let mut weeks = vec![week(None, u7d, 100.0 - reserve - u7d, reset_7d, limit_7d)];
+    if let (Some(s), Some(model)) = (&snapshot, &ctx.model) {
+        // All the expected use counts on the model's window, also of runs
+        // that may use another model: the cautious side.
+        weeks.extend(
+            s.scoped
+                .iter()
+                .filter(|w| model_matches(model, &w.label))
+                .map(|w| {
+                    week(
+                        Some(w.label.clone()),
+                        w.utilization,
+                        100.0 - w.utilization,
+                        w.resets_at,
+                        hard,
+                    )
+                }),
+        );
+    }
     Assessed {
         snapshot,
-        u5h,
+        known,
         u7d,
-        reset_7d,
+        reset_5h,
         limited,
         eligible,
-        load_5h,
-        add_5h,
+        load_5h: u5h + burn * h,
+        add_5h: add * h,
+        weeks,
     }
 }
 
-fn slack7(input: &AccountInput, a: &Assessed) -> f64 {
-    (100.0 - f64::from(input.reserve_7d) - a.u7d).max(0.0) / 100.0
-}
-
-/// The slack term `min(1, slack7 / days)`.
-fn slack_term(input: &AccountInput, a: &Assessed, now: i64) -> f64 {
-    let days = a
-        .reset_7d
-        .map(|r| ((r - now) as f64 / 86_400.0).max(0.25))
-        .unwrap_or(7.0);
-    (slack7(input, a) / days).min(1.0)
-}
-
-/// The smart score (higher is better). The 5h terms use the expected use
-/// with this run added, so live runs count.
+/// The smart score (higher is better): mostly how fast the account's week
+/// must be used for none of it to expire, then the 5h room left with this
+/// run. An account the run does not fit on scores half a point less.
 pub(crate) fn smart_score(input: &AccountInput, a: &Assessed, ctx: &ViewCtx) -> f64 {
-    let u5h = a.with_run();
-    let base = 0.45 * (1.0 - u5h / 100.0)
-        + 0.35 * slack_term(input, a, ctx.now)
-        + 0.20 * (1.0 - a.u7d / 100.0);
+    let base = WEEK_WEIGHT * a.urgency(ctx.now) + ROOM_WEIGHT * (1.0 - a.with_run() / 100.0);
     let mut score = capacity(input) * input.weight * base;
-    if u5h >= ctx.settings.soft_5h {
+    if !a.fits(ctx.settings.soft_5h) {
         score -= 0.50;
     }
-    if a.snapshot.is_none() {
+    if !a.known {
         score -= 0.15;
     }
     score
@@ -291,8 +416,7 @@ pub(crate) fn pick_assessed(
             earliest_id: earliest.map(|(i, _)| inputs[i].profile_id.clone()),
         };
     }
-    let soft = ctx.settings.soft_5h;
-    let fits = |i: usize| assessed[i].with_run() < soft;
+    let fits = |i: usize| assessed[i].fits(ctx.settings.soft_5h);
     // A resume goes back to the account that last ran the session while it
     // has room: its prompt cache is there.
     if let Some(p) = &ctx.prefer
@@ -314,7 +438,7 @@ pub(crate) fn pick_assessed(
         match ctx.settings.policy {
             Policy::Priority => match cands.iter().copied().find(|&i| fits(i)) {
                 Some(i) if i == cands[0] => (i, "first in priority order".to_string()),
-                Some(i) => (i, "first in priority order with 5h room".to_string()),
+                Some(i) => (i, "first in priority order with room".to_string()),
                 None => (cands[0], "first in priority order".to_string()),
             },
             Policy::RoundRobin => {
@@ -343,10 +467,17 @@ pub(crate) fn pick_assessed(
                 (b, format!("most headroom ({h:.0}%)"))
             }
             Policy::Smart => {
-                let b = argmax(&cands, inputs, |i| {
-                    smart_score(&inputs[i], &assessed[i], ctx)
-                });
-                (b, smart_reason(b, &cands, inputs, assessed, ctx))
+                // Where the run fits, whatever the scores (plan and weight
+                // scale them); nowhere: the best score of all.
+                let fitting: Vec<usize> = cands.iter().copied().filter(|&i| fits(i)).collect();
+                let pool = if fitting.is_empty() { &cands } else { &fitting };
+                let b = argmax(pool, inputs, |i| smart_score(&inputs[i], &assessed[i], ctx));
+                let why = if pool.len() == 1 {
+                    "the only account with room for this run".to_string()
+                } else {
+                    smart_reason(b, pool, inputs, assessed, ctx)
+                };
+                (b, why)
             }
         }
     };
@@ -381,6 +512,7 @@ pub fn plan(
         };
         if let Some(i) = inputs.iter_mut().find(|i| i.profile_id == id) {
             i.load += ctx.new_run.max(0.0);
+            i.fresh += ctx.new_run.max(0.0);
             i.sessions_elsewhere += 1;
             i.last_used = Some(ctx.now);
         }
@@ -392,9 +524,10 @@ pub fn plan(
 /// The most runs [`capacity`] counts.
 pub const MAX_CAPACITY: u32 = 50;
 
-/// How many more runs the pool takes now before every usable account's
-/// expected 5h use would reach `soft_5h`: each run goes to the account
-/// with the most room. `None` when the load is off (`run_load = 0`).
+/// How many more runs the pool takes now before no usable account has
+/// room for one (its expected 5h use would reach `soft_5h`, or a weekly
+/// window its limit): each run goes to the account with the most 5h room.
+/// `None` when the load is off (`run_load = 0`).
 pub fn capacity_left(
     inputs: &[AccountInput],
     usage: &HashMap<String, CachedUsage>,
@@ -410,12 +543,11 @@ pub fn capacity_left(
             .iter()
             .enumerate()
             .map(|(i, x)| (i, assess(x, usage.get(&x.profile_id), ctx)))
-            .filter(|(_, a)| {
-                a.eligible && a.limited.is_none() && a.with_run() < ctx.settings.soft_5h
-            })
+            .filter(|(_, a)| a.eligible && a.limited.is_none() && a.fits(ctx.settings.soft_5h))
             .min_by(|(_, a), (_, b)| a.with_run().total_cmp(&b.with_run()));
         let Some((i, _)) = best else { break };
         inputs[i].load += 1.0;
+        inputs[i].fresh += 1.0;
         n += 1;
     }
     Some(n)
@@ -455,39 +587,59 @@ pub fn load_info(
         .collect()
 }
 
+/// Why smart picked `b` from `pool` (two accounts or more): the term of
+/// the score that put it ahead of the best of the others.
 fn smart_reason(
     b: usize,
-    cands: &[usize],
+    pool: &[usize],
     inputs: &[AccountInput],
     assessed: &[Assessed],
     ctx: &ViewCtx,
 ) -> String {
     let a = &assessed[b];
-    if a.snapshot.is_none() {
+    if !a.known {
         return "usage unknown, others busier".to_string();
     }
-    let others = || cands.iter().filter(move |&&i| i != b);
-    let slack = slack_term(&inputs[b], a, ctx.now);
-    if let Some(r) = a.reset_7d
-        && slack > 0.0
-        && others().all(|&i| slack_term(&inputs[i], &assessed[i], ctx.now) < slack)
+    let others: Vec<usize> = pool.iter().copied().filter(|&i| i != b).collect();
+    let next = argmax(&others, inputs, |i| {
+        smart_score(&inputs[i], &assessed[i], ctx)
+    });
+    // Both terms as the score counts them, plan and weight included.
+    let terms = |i: usize| {
+        let scale = capacity(&inputs[i]) * inputs[i].weight;
+        (
+            scale * WEEK_WEIGHT * assessed[i].urgency(ctx.now),
+            scale * ROOM_WEIGHT * (1.0 - assessed[i].with_run() / 100.0),
+        )
+    };
+    let ((week_b, room_b), (week_n, room_n)) = (terms(b), terms(next));
+    let by_week = week_b - week_n;
+    if by_week > 1e-9 && by_week > room_b - room_n {
+        let (w, _) = a.week(ctx.now);
+        let unused = w.unused;
+        return match (&w.label, w.resets_at) {
+            (None, Some(r)) => format!(
+                "weekly resets in {} with {unused:.0}% unused",
+                fmt_duration(r - ctx.now)
+            ),
+            (Some(l), Some(r)) => format!(
+                "{l} week resets in {} with {unused:.0}% unused",
+                fmt_duration(r - ctx.now)
+            ),
+            (None, None) => format!("most weekly room ({unused:.0}% unused)"),
+            (Some(l), None) => format!("most {l} room ({unused:.0}% unused)"),
+        };
+    }
+    let room = 100.0 - a.with_run();
+    if others
+        .iter()
+        .all(|&i| 100.0 - assessed[i].with_run() <= room)
     {
-        return format!(
-            "weekly resets in {} with {:.0}% unused",
-            fmt_duration(r - ctx.now),
-            slack7(&inputs[b], a) * 100.0
-        );
-    }
-    if a.add_5h > 0.0 {
-        let room = 100.0 - a.with_run();
-        if others().all(|&i| 100.0 - assessed[i].with_run() <= room) {
-            return format!("most 5h room ({room:.0}% left with this run)");
-        }
-        return "best overall score".to_string();
-    }
-    let h5 = 100.0 - a.u5h;
-    if others().all(|&i| 100.0 - assessed[i].u5h <= h5) {
-        return format!("most 5h headroom ({h5:.0}%)");
+        return if a.add_5h > 0.0 {
+            format!("most 5h room ({room:.0}% left with this run)")
+        } else {
+            format!("most 5h headroom ({room:.0}%)")
+        };
     }
     "best overall score".to_string()
 }
@@ -723,7 +875,8 @@ mod tests {
         c.new_run = 2.0;
         let p = plan(&inputs, &u, &c, 3);
         assert_eq!(ids(&p), ["a", "b", "c"]);
-        assert_eq!(p[0].reason, "most 5h room (40% left with this run)");
+        // b and c would end at soft_5h or over it (80, 90).
+        assert_eq!(p[0].reason, "the only account with room for this run");
     }
 
     #[test]
@@ -753,9 +906,18 @@ mod tests {
         // a fills at 60%/h (another machine, claude.ai): 10 + 60 + 25 > b's 55.
         inputs[0].slope_5h = Some(60.0);
         assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
-        // A slope below what the runs explain does not lower their load.
+        // Two runs that just came to a don't show in its rate yet: they
+        // count on top of it (10 + 1 + 50 + 25).
         inputs[0].slope_5h = Some(1.0);
         inputs[0].load = 2.0;
+        inputs[0].fresh = 2.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
+        // After an hour there the rate shows what they really use: two
+        // sessions that wait for their user are not two working runs.
+        inputs[0].fresh = 0.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+        // Without a rate (no recent samples) the runs count in full.
+        inputs[0].slope_5h = None;
         assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
         // A learned rate replaces run_load for that account.
         let (mut inputs, u, c) = lanes();
@@ -831,10 +993,261 @@ mod tests {
         let p = pick(&inputs, &u, &c);
         assert_eq!(
             (p.chosen.as_deref(), p.reason.as_str()),
-            (Some("b"), "first in priority order with 5h room")
+            (Some("b"), "first in priority order with room")
         );
         inputs[0].load = 0.0;
         assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+    }
+
+    /// The pool that started this (2026-11-25): pb2's week resets in 3h52m
+    /// with 26% unused, pb5's in three days with an empty 5h window.
+    fn expiring() -> (Vec<AccountInput>, HashMap<String, CachedUsage>, ViewCtx) {
+        let mut c = ctx(Policy::Smart);
+        c.run_load = 25.0;
+        let now = c.now;
+        let mut u = HashMap::from([
+            usage("pb2", 22.0, 74.0, Some(now + 13_920), now),
+            usage("pb5", 0.0, 41.0, Some(now + 3 * 86_400), now),
+        ]);
+        u.get_mut("pb2")
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .five_hour = Some(prism_core::model::Window {
+            utilization: 22.0,
+            resets_at: Some(now + 6960),
+            inferred: false,
+        });
+        (vec![input("pb2"), input("pb5")], u, c)
+    }
+
+    /// The view's reason per profile id (the views come in display order).
+    fn reasons(
+        inputs: &[AccountInput],
+        u: &HashMap<String, CachedUsage>,
+        c: &ViewCtx,
+    ) -> HashMap<String, Option<String>> {
+        crate::views::build_views(inputs, u, &HashMap::new(), c)
+            .into_iter()
+            .map(|v| (v.profile_id, v.reason))
+            .collect()
+    }
+
+    #[test]
+    fn smart_uses_up_the_week_that_expires() {
+        let (mut inputs, u, mut c) = expiring();
+        // Three sessions open on pb2 for hours use 5%/h between them: the
+        // run fits (22 + 5 + 25), and pb2's week is the one to use up.
+        inputs[0].load = 2.25;
+        inputs[0].sessions_elsewhere = 3;
+        inputs[0].slope_5h = Some(5.0);
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("pb2"), "weekly resets in 3h52m with 26% unused")
+        );
+        assert_eq!(reasons(&inputs, &u, &c)["pb5"], None);
+        // The same three, all started just now: within the hour pb2's 5h
+        // window would not hold one more.
+        inputs[0].fresh = 2.25;
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("pb5"), "the only account with room for this run")
+        );
+        assert_eq!(
+            reasons(&inputs, &u, &c)["pb2"].as_deref(),
+            Some("5h would fill within the hour, resets in 1h56m")
+        );
+        // The account a session moves from gets no verdict.
+        c.exclude = Some("pb2".into());
+        assert_eq!(reasons(&inputs, &u, &c)["pb2"], None);
+    }
+
+    #[test]
+    fn old_usage_of_an_account_in_use_is_unknown() {
+        let (mut inputs, mut u, c) = expiring();
+        let now = c.now;
+        // pb2's numbers are two days old (its login can't be read).
+        u.get_mut("pb2")
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now - 2 * 86_400;
+        // Nothing ran there since: they still stand.
+        inputs[0].last_used = Some(now - 3 * 86_400);
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("pb2"));
+        // A session started there yesterday: what is left of its week is
+        // anyone's guess, so it does not come first for it.
+        inputs[0].last_used = Some(now - 86_400);
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("pb5"));
+        // The same with a run on it now.
+        inputs[0].last_used = None;
+        inputs[0].sessions_elsewhere = 1;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("pb5"));
+        // It still takes a run when the others are busier, and says so:
+        // pb5 at 54% of its 5h window and 88% of its week, pb2 idle.
+        let window = |used| {
+            Some(prism_core::model::Window {
+                utilization: used,
+                resets_at: None,
+                inferred: false,
+            })
+        };
+        u.get_mut("pb2")
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .five_hour = window(0.0);
+        let s = u.get_mut("pb5").unwrap().snapshot.as_mut().unwrap();
+        s.five_hour = window(54.0);
+        s.seven_day.as_mut().unwrap().utilization = 88.0;
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("pb2"), "usage unknown, others busier")
+        );
+        // Usage a few minutes old is what polling gives: known.
+        u.get_mut("pb2")
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .fetched_at = now - 600;
+        assert_eq!(
+            pick(&inputs, &u, &c).reason,
+            "weekly resets in 3h52m with 26% unused"
+        );
+    }
+
+    #[test]
+    fn a_run_needs_an_hour_of_weekly_room() {
+        let mut c = ctx(Policy::Smart);
+        c.run_load = 25.0;
+        let now = c.now;
+        // a: an empty 5h window, but 92% of its week used (limited at 95)
+        // with three days to go. An hour of the run is 5 points of a week.
+        let inputs = vec![input("a"), input("b")];
+        let mut u = HashMap::from([
+            usage("a", 0.0, 92.0, Some(now + 3 * 86_400), now),
+            usage("b", 50.0, 40.0, Some(now + 3 * 86_400), now),
+        ]);
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("b"), "the only account with room for this run")
+        );
+        assert_eq!(
+            reasons(&inputs, &u, &c)["a"].as_deref(),
+            Some("under an hour of weekly room, resets in 3d0h")
+        );
+        // Where the week measured half as dear, the hour fits.
+        let mut cheap = inputs.clone();
+        cheap[0].week_per_5h = Some(0.1);
+        assert_eq!(pick(&cheap, &u, &c).chosen.as_deref(), Some("a"));
+        // Runs already there use the week too.
+        cheap[0].load = 1.0;
+        assert_eq!(pick(&cheap, &u, &c).chosen.as_deref(), Some("b"));
+        // The week resets in 6 minutes: the run uses half a point of it.
+        u.get_mut("a").unwrap().snapshot.as_mut().unwrap().seven_day =
+            Some(prism_core::model::Window {
+                utilization: 92.0,
+                resets_at: Some(now + 360),
+                inferred: false,
+            });
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn without_load_only_limits_count() {
+        let mut c = ctx(Policy::Smart);
+        let now = c.now;
+        let inputs = vec![input("a"), input("b")];
+        // No forecast: a is under its weekly limit (95), so a run fits.
+        let u = HashMap::from([
+            usage("a", 0.0, 94.0, Some(now + 3 * 86_400), now),
+            usage("b", 50.0, 40.0, Some(now + 3 * 86_400), now),
+        ]);
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("a"), "most 5h headroom (100%)")
+        );
+        c.run_load = 25.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn the_models_week_binds_its_runs() {
+        let (inputs, mut u, mut c) = expiring();
+        let now = c.now;
+        let fable = |u: &mut HashMap<String, CachedUsage>, used: f64| {
+            u.get_mut("pb2").unwrap().snapshot.as_mut().unwrap().scoped =
+                vec![prism_core::model::ScopedWindow {
+                    label: "Fable".into(),
+                    kind: "weekly_scoped".into(),
+                    utilization: used,
+                    resets_at: Some(now + 13_920),
+                    inferred: false,
+                }];
+        };
+        fable(&mut u, 84.0);
+        // No model known: the 7-day window alone.
+        assert_eq!(
+            pick(&inputs, &u, &c).reason,
+            "weekly resets in 3h52m with 26% unused"
+        );
+        // A Fable run can use up 16 points, not 26.
+        c.model = Some("claude-fable-5-2".into());
+        let p = pick(&inputs, &u, &c);
+        assert_eq!(
+            (p.chosen.as_deref(), p.reason.as_str()),
+            (Some("pb2"), "Fable week resets in 3h52m with 16% unused")
+        );
+        // At 92% an hour of the run would reach the model's limit.
+        fable(&mut u, 92.0);
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("pb5"));
+        assert_eq!(
+            reasons(&inputs, &u, &c)["pb2"].as_deref(),
+            Some("under an hour of Fable room, resets in 3h52m")
+        );
+        // A run of another model is not bound by it.
+        c.model = Some("claude-opus-5-5".into());
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("pb2"));
+    }
+
+    #[test]
+    fn room_comes_before_plan_and_weight() {
+        let (mut inputs, u, c) = lanes();
+        // c is a 20x plan the user weighs 5x, with runs on it: its score is
+        // the highest, but the run does not fit (40 + 40 + 12.5).
+        inputs[2].identity.rate_limit_tier = Some("default_claude_max_20x".into());
+        inputs[2].weight = 5.0;
+        inputs[2].load = 3.2;
+        let a: Vec<Assessed> = inputs
+            .iter()
+            .map(|i| assess(i, u.get(&i.profile_id), &c))
+            .collect();
+        assert!(smart_score(&inputs[2], &a[2], &c) > smart_score(&inputs[0], &a[0], &c));
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("a"));
+        // With room nowhere, the best score takes it.
+        inputs[0].load = 3.0;
+        inputs[1].load = 3.0;
+        assert_eq!(pick(&inputs, &u, &c).chosen.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn capacity_stops_at_a_weekly_limit() {
+        let (inputs, mut u, c) = lanes();
+        // Every week at 88% (limited at 95): one run each (93), not two.
+        for id in ["a", "b", "c"] {
+            let s = u.get_mut(id).unwrap().snapshot.as_mut().unwrap();
+            s.seven_day.as_mut().unwrap().utilization = 88.0;
+        }
+        assert_eq!(capacity_left(&inputs, &u, &c), Some(3));
     }
 
     #[test]

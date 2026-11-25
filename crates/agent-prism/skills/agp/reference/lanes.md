@@ -32,8 +32,8 @@ agp pick --n 3 --codex --json | jq -r '.plan[] | "\(.label)\t\(.reason)"'
 ```
 
 - `capacity.claude` / `capacity.codex`: how many more runs the pool can
-  take now before every account would reach its soft 5h mark
-  (`balance.soft_5h`).
+  take now before no account has room for one: its soft 5h mark
+  (`balance.soft_5h`), or a weekly limit, would be reached within the hour.
 - agp weighs each lane by past runs like it (same repo, similar first
   prompt): a lane whose earlier copies burned 2x counts as 2 runs, so heavy
   lanes spread on their own. `agp learn --prompt "<lane prompt>" --json`

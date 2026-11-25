@@ -885,15 +885,10 @@ pub fn touch_last_used(paths: &Paths, id: &str, now: i64) {
 pub fn run_loads(paths: &Paths, now: i64) -> HashMap<String, registry::Load> {
     let live = registry::list_live(paths);
     let mut loads = registry::loads(&live, std::process::id(), now);
-    for (profile, weight) in crate::bg::running(paths, now) {
-        loads.entry(profile).or_default().add(weight);
+    for (profile, weight, since) in crate::bg::running(paths, now) {
+        loads.entry(profile).or_default().add(weight, now - since);
     }
     loads
-}
-
-/// How fast `id`'s 5h window fills now (%/h), from the last hour of samples.
-pub fn burn_rate(cache: &UsageCache, id: &str, now: i64) -> Option<f64> {
-    infer::rate_5h(&cache.samples(id, now - infer::LOOKBACK_5H_SECS), now)
 }
 
 /// Balancer inputs for every profile, in config order.
@@ -923,6 +918,8 @@ pub fn account_inputs(
                 }
                 Err(e) => TokenState::Unreadable(format!("{e:#}")),
             };
+            // One read of the samples file serves both rates.
+            let samples = cache.samples(&p.id, now - prism_usage::cache::SAMPLE_RETENTION_SECS);
             AccountInput {
                 profile_id: p.id.clone(),
                 label: p.label.clone(),
@@ -934,7 +931,9 @@ pub fn account_inputs(
                 token,
                 sessions_elsewhere: loads.get(&p.id).map_or(0, |l| l.runs),
                 load: loads.get(&p.id).map_or(0.0, |l| l.weight),
-                slope_5h: burn_rate(&cache, &p.id, now),
+                fresh: loads.get(&p.id).map_or(0.0, |l| l.fresh),
+                slope_5h: infer::rate_5h(&samples, now),
+                week_per_5h: infer::week_per_5h(&samples),
                 run_rate: None,
                 active_here: active == Some(p.id.as_str()),
                 last_used: last.get(&p.id).copied(),

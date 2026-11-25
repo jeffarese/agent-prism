@@ -47,7 +47,7 @@ const POLICIES: [(Policy, &str, &str); 4] = [
     (
         Policy::Smart,
         "Smart",
-        "Recommended. Balances what is left now and this week.",
+        "Recommended. Weighs 5h room and the week that expires first.",
     ),
     (
         Policy::Priority,
@@ -366,7 +366,9 @@ impl Wizard {
                     token,
                     sessions_elsewhere: 0,
                     load: 0.0,
+                    fresh: 0.0,
                     slope_5h: None,
+                    week_per_5h: None,
                     run_rate: None,
                     active_here: false,
                     last_used: None,

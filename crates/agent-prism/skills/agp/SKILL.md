@@ -54,7 +54,8 @@ wait
 ```
 
 - Read `capacity` before a big fan-out. It is how many more runs the pool
-  takes now before every account would reach its soft 5h mark. Need more lanes
+  takes now before no account has room for one (its soft 5h mark or a weekly
+  limit would be reached within the hour). Need more lanes
   than that? Tell the user. Extra lanes share accounts and hit limits
   sooner. Run them in batches instead.
 - `agp pick --n 6` shows where 6 new runs would go. It claims nothing.

@@ -148,6 +148,18 @@ pub fn find_transcript(projects: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// How long a run takes to show in full in its account's measured burn
+/// rate: the hour of usage samples the rate looks back on. Until then the
+/// balancer counts the run by its weight, less as it ages (DESIGN §6.6).
+pub const FRESH_SECS: i64 = 3600;
+
+/// The share of a run that came to its account `age_secs` ago which the
+/// measured burn rate does not show yet: 1 at the start, 0 from
+/// [`FRESH_SECS`] on.
+pub fn freshness(age_secs: i64) -> f64 {
+    (1.0 - age_secs.max(0) as f64 / FRESH_SECS as f64).clamp(0.0, 1.0)
+}
+
 /// The runs on one account.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Load {
@@ -155,13 +167,17 @@ pub struct Load {
     pub runs: u32,
     /// Their summed weight.
     pub weight: f64,
+    /// The part of `weight` the account's measured burn rate does not
+    /// show yet: each run's weight times its [`freshness`].
+    pub fresh: f64,
 }
 
 impl Load {
-    /// Adds one run of `weight`.
-    pub fn add(&mut self, weight: f64) {
+    /// Adds one run of `weight` that came to the account `age_secs` ago.
+    pub fn add(&mut self, weight: f64, age_secs: i64) {
         self.runs += 1;
         self.weight += weight;
+        self.fresh += weight * freshness(age_secs);
     }
 }
 
@@ -169,7 +185,10 @@ impl Load {
 pub fn loads(records: &[SessionRecord], skip: u32, now: i64) -> HashMap<String, Load> {
     let mut out: HashMap<String, Load> = HashMap::new();
     for r in records.iter().filter(|r| r.pid != skip) {
-        out.entry(r.profile.clone()).or_default().add(r.weight(now));
+        let since = r.switched_at.unwrap_or(r.started_at);
+        out.entry(r.profile.clone())
+            .or_default()
+            .add(r.weight(now), now - since);
     }
     out
 }
@@ -435,15 +454,25 @@ mod tests {
         idle.busy = false;
         let mut b = rec(3);
         b.profile = "b".into();
-        let l = loads(&[rec(1), idle, b, rec(4)], 4, 0);
+        // The records started at 1: at 1 they are all new on their account.
+        let l = loads(&[rec(1), idle.clone(), b, rec(4)], 4, 1);
         assert_eq!(
             l["a"],
             Load {
                 runs: 2,
-                weight: 1.0 + IDLE_WEIGHT
+                weight: 1.0 + IDLE_WEIGHT,
+                fresh: 1.0 + IDLE_WEIGHT,
             }
         );
         assert_eq!(l["b"].runs, 1);
+        // Half an hour on, the measured burn rate shows half of each; after
+        // an hour all of it. A move starts the hour again.
+        let half = loads(&[rec(1), idle.clone()], 4, 1 + FRESH_SECS / 2)["a"];
+        assert_eq!((half.weight, half.fresh), (1.25, 0.625));
+        let mut moved = rec(1);
+        moved.switched_at = Some(FRESH_SECS);
+        let old = loads(&[moved, idle], 4, 1 + FRESH_SECS)["a"];
+        assert_eq!((old.weight, old.fresh), (1.25, 1.0 - 1.0 / 3600.0));
         let mut codex = rec(5);
         codex.tool = Tool::Codex;
         assert_eq!(codex.weight(0), CODEX_TUI_WEIGHT);
