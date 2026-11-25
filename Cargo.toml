@@ -31,7 +31,7 @@ vt100 = "0.16"
 tui-term = "0.3"
 rustix = { version = "1", features = ["termios", "process", "pty", "stdio", "fs"] }
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 crossbeam-channel = "0.5"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
