@@ -598,12 +598,21 @@ another model.
   expire (1: all of it within a day), taken from the window that leaves the
   run the least to use up. What an account has not used by its weekly reset
   is lost, and the week is the window that runs out, so a run goes where
-  the quota it uses would expire first: a week that resets in 4 hours with
-  26% unused comes before one with 59% unused and three days left, unless
+  the quota it uses would expire first: a week that resets in 8 hours with
+  30% unused comes before one with 59% unused and three days left, unless
   the other account has about half a 5h window more room. The 5h room
   spreads runs between accounts whose weeks are alike, and decides when no
   week is about to expire. Tie → least recently used. With `run_load = 0`,
   `with_run = u5h` and a run fits any account that is not limited.
+
+  A week in its last 5 hours comes before the score. What the account has
+  not used by the reset is lost for good, and one 5h window is the most it
+  can still take: of the accounts the run fits, `smart` takes the one
+  whose week resets within 5 hours, the first to reset if there are
+  several, whatever the 5h room elsewhere. The week is the one `urgency`
+  is taken from, so a run of a model whose own week has days to go and
+  less left is not drawn to a 7-day window that ends. An account with
+  unknown usage has no last hours.
 
   The weights are measured, not derived. More weight on the week puts a
   day's runs on one account, which fills its 5h window. A simulation with
@@ -612,8 +621,12 @@ another model.
   with 0.40, no more limit switches at a light or normal demand, and 1%
   more work served with a sixth fewer switches when the demand exceeds the
   pool; with 0.65, 2% more work served then, but one more 5h limit switch
-  a week at a normal demand. `cargo run --release -p prism-usage --example
-  balance_sim` runs it; run it before and after a change to the score.
+  a week at a normal demand. The last hours are measured the same way:
+  with 5 hours, the same work served and a limit switch more every ten
+  weeks at a normal demand; with 10 hours, one every three weeks; with 24
+  hours, one a week, as with 0.65. `cargo run --release -p prism-usage
+  --example balance_sim` runs it; run it before and after a change to the
+  score.
 
   Until 2026-11-25 the score was `0.45 * 5h room + 0.35 * urgency + 0.20 *
   weekly room`. Its weekly-room term pulled away from the account whose

@@ -51,6 +51,13 @@ const WEEK_WEIGHT: f64 = 0.40;
 /// The smart score's weight of the 5h room left with this run.
 const ROOM_WEIGHT: f64 = 0.60;
 
+/// The last hours of an account's week. What it has not used by then is
+/// lost for good, and one 5h window is the most it can still take, so
+/// `smart` puts a run that fits there first, whatever the 5h room
+/// elsewhere. Simulated (5 accounts, 8 weeks), 5 hours cost a limit switch
+/// more every ten weeks at a normal demand; 24 hours cost one a week.
+const LAST_HOURS_SECS: i64 = 5 * 3600;
+
 /// A weekly window that binds the run: the 7-day window, or a scoped
 /// window of the run's model.
 #[derive(Clone, Debug)]
@@ -77,6 +84,24 @@ impl Week {
             .map(|r| ((r - now) as f64 / 86_400.0).max(0.25))
             .unwrap_or(7.0);
         (self.unused / 100.0 / days).min(1.0)
+    }
+
+    /// Why a run goes to this window's account: what is left of it, and
+    /// when that expires.
+    fn reason(&self, now: i64) -> String {
+        let unused = self.unused;
+        match (&self.label, self.resets_at) {
+            (None, Some(r)) => format!(
+                "weekly resets in {} with {unused:.0}% unused",
+                fmt_duration(r - now)
+            ),
+            (Some(l), Some(r)) => format!(
+                "{l} week resets in {} with {unused:.0}% unused",
+                fmt_duration(r - now)
+            ),
+            (None, None) => format!("most weekly room ({unused:.0}% unused)"),
+            (Some(l), None) => format!("most {l} room ({unused:.0}% unused)"),
+        }
     }
 }
 
@@ -132,6 +157,15 @@ impl Assessed {
     /// (nothing says that its week would go unused).
     pub fn urgency(&self, now: i64) -> f64 {
         if self.known { self.week(now).1 } else { 0.0 }
+    }
+
+    /// When the account's week resets, if that is within
+    /// [`LAST_HOURS_SECS`] and its usage is known: the week is in its last
+    /// hours. The week is the one the urgency is taken from, so a model's
+    /// week with days to go keeps its runs off a 7-day window that ends.
+    pub fn last_hours(&self, now: i64) -> Option<i64> {
+        let r = self.week(now).0.resets_at?;
+        (self.known && r > now && r - now <= LAST_HOURS_SECS).then_some(r)
     }
 
     /// The window one more run would bring near its limit within the hour:
@@ -316,9 +350,10 @@ pub(crate) fn assess(
     }
 }
 
-/// The smart score (higher is better): mostly how fast the account's week
-/// must be used for none of it to expire, then the 5h room left with this
-/// run. An account the run does not fit on scores half a point less.
+/// The smart score (higher is better): how fast the account's week must be
+/// used for none of it to expire, and the 5h room left with this run. An
+/// account the run does not fit on scores half a point less. A week in its
+/// last hours comes before the score ([`LAST_HOURS_SECS`]).
 pub(crate) fn smart_score(input: &AccountInput, a: &Assessed, ctx: &ViewCtx) -> f64 {
     let base = WEEK_WEIGHT * a.urgency(ctx.now) + ROOM_WEIGHT * (1.0 - a.with_run() / 100.0);
     let mut score = capacity(input) * input.weight * base;
@@ -471,13 +506,30 @@ pub(crate) fn pick_assessed(
                 // scale them); nowhere: the best score of all.
                 let fitting: Vec<usize> = cands.iter().copied().filter(|&i| fits(i)).collect();
                 let pool = if fitting.is_empty() { &cands } else { &fitting };
-                let b = argmax(pool, inputs, |i| smart_score(&inputs[i], &assessed[i], ctx));
-                let why = if pool.len() == 1 {
-                    "the only account with room for this run".to_string()
-                } else {
-                    smart_reason(b, pool, inputs, assessed, ctx)
+                let score = |i: usize| smart_score(&inputs[i], &assessed[i], ctx);
+                // A week in its last hours comes before the score: of
+                // those the run fits, the one that expires first.
+                let last = |i: usize| assessed[i].last_hours(ctx.now);
+                let ending: Vec<usize> = match fitting.iter().filter_map(|&i| last(i)).min() {
+                    Some(t) => fitting
+                        .iter()
+                        .copied()
+                        .filter(|&i| last(i) == Some(t))
+                        .collect(),
+                    None => Vec::new(),
                 };
-                (b, why)
+                if pool.len() == 1 {
+                    (
+                        pool[0],
+                        "the only account with room for this run".to_string(),
+                    )
+                } else if !ending.is_empty() {
+                    let b = argmax(&ending, inputs, score);
+                    (b, assessed[b].week(ctx.now).0.reason(ctx.now))
+                } else {
+                    let b = argmax(pool, inputs, score);
+                    (b, smart_reason(b, pool, inputs, assessed, ctx))
+                }
             }
         }
     };
@@ -615,20 +667,7 @@ fn smart_reason(
     let ((week_b, room_b), (week_n, room_n)) = (terms(b), terms(next));
     let by_week = week_b - week_n;
     if by_week > 1e-9 && by_week > room_b - room_n {
-        let (w, _) = a.week(ctx.now);
-        let unused = w.unused;
-        return match (&w.label, w.resets_at) {
-            (None, Some(r)) => format!(
-                "weekly resets in {} with {unused:.0}% unused",
-                fmt_duration(r - ctx.now)
-            ),
-            (Some(l), Some(r)) => format!(
-                "{l} week resets in {} with {unused:.0}% unused",
-                fmt_duration(r - ctx.now)
-            ),
-            (None, None) => format!("most weekly room ({unused:.0}% unused)"),
-            (Some(l), None) => format!("most {l} room ({unused:.0}% unused)"),
-        };
+        return a.week(ctx.now).0.reason(ctx.now);
     }
     let room = 100.0 - a.with_run();
     if others
@@ -1063,6 +1102,92 @@ mod tests {
         // The account a session moves from gets no verdict.
         c.exclude = Some("pb2".into());
         assert_eq!(reasons(&inputs, &u, &c)["pb2"], None);
+    }
+
+    #[test]
+    fn smart_uses_a_week_in_its_last_hours_first() {
+        let (mut inputs, mut u, mut c) = expiring();
+        let now = c.now;
+        // pb2: this much of its 5h window and of its week used, the week
+        // ending in `ends` seconds.
+        let pb2 = |u: &mut HashMap<String, CachedUsage>, u5h: f64, u7d: f64, ends: i64| {
+            let s = u.get_mut("pb2").unwrap().snapshot.as_mut().unwrap();
+            s.five_hour.as_mut().unwrap().utilization = u5h;
+            let w = s.seven_day.as_mut().unwrap();
+            (w.utilization, w.resets_at) = (u7d, Some(now + ends));
+        };
+        let chosen = |inputs: &[AccountInput], u: &HashMap<String, CachedUsage>, c: &ViewCtx| {
+            let p = pick(inputs, u, c);
+            (p.chosen.unwrap(), p.reason)
+        };
+        let is = |id: &str, why: &str| (id.to_string(), why.to_string());
+        // With 15% of its week left and less 5h room than pb5, pb2 loses
+        // on the score while its week has more than 5 hours to go, and
+        // comes first in its last 5 hours.
+        pb2(&mut u, 40.0, 85.0, 5 * 3600 + 60);
+        assert_eq!(
+            chosen(&inputs, &u, &c),
+            is("pb5", "most 5h room (75% left with this run)")
+        );
+        pb2(&mut u, 40.0, 85.0, 5 * 3600);
+        assert_eq!(
+            chosen(&inputs, &u, &c),
+            is("pb2", "weekly resets in 5h0m with 15% unused")
+        );
+        // Only where the run fits: 50 + 25 is under the soft mark of 80,
+        // 56 + 25 is not.
+        pb2(&mut u, 50.0, 85.0, 3 * 3600);
+        assert_eq!(chosen(&inputs, &u, &c).0, "pb2");
+        pb2(&mut u, 56.0, 85.0, 3 * 3600);
+        assert_eq!(
+            chosen(&inputs, &u, &c),
+            is("pb5", "the only account with room for this run")
+        );
+        // Not on usage nobody has read for over an hour.
+        pb2(&mut u, 40.0, 85.0, 3 * 3600);
+        let fetched = |u: &mut HashMap<String, CachedUsage>, at: i64| {
+            u.get_mut("pb2")
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .fetched_at = at;
+        };
+        fetched(&mut u, now - 3700);
+        inputs[0].sessions_elsewhere = 1;
+        assert_eq!(chosen(&inputs, &u, &c).0, "pb5");
+        fetched(&mut u, now);
+        inputs[0].sessions_elsewhere = 0;
+        // Not for a run of a model whose own week has days to go and less
+        // left than the 7-day window: that week is the one the run uses up.
+        u.get_mut("pb2").unwrap().snapshot.as_mut().unwrap().scoped =
+            vec![prism_core::model::ScopedWindow {
+                label: "Fable".into(),
+                kind: "weekly_scoped".into(),
+                utilization: 80.0,
+                resets_at: Some(now + 3 * 86_400),
+                inferred: false,
+            }];
+        assert_eq!(chosen(&inputs, &u, &c).0, "pb2");
+        c.model = Some("claude-fable-5-2".into());
+        assert_eq!(chosen(&inputs, &u, &c).0, "pb5");
+        c.model = None;
+        // Two weeks in their last hours: the one that ends first, though
+        // the other has more room.
+        let pb5_ends = |u: &mut HashMap<String, CachedUsage>, ends: i64| {
+            let s = u.get_mut("pb5").unwrap().snapshot.as_mut().unwrap();
+            s.seven_day.as_mut().unwrap().resets_at = Some(now + ends);
+        };
+        pb5_ends(&mut u, 4 * 3600);
+        assert_eq!(
+            chosen(&inputs, &u, &c),
+            is("pb2", "weekly resets in 3h0m with 15% unused")
+        );
+        pb5_ends(&mut u, 2 * 3600);
+        assert_eq!(
+            chosen(&inputs, &u, &c),
+            is("pb5", "weekly resets in 2h0m with 59% unused")
+        );
     }
 
     #[test]

@@ -170,10 +170,11 @@ for t in api ui docs; do agp --on-limit switch -p "do the $t part" > "$t.md" & d
   instead of a, a, a.
 - A run goes where it fits: where, within the hour, it brings neither the
   5h window near `soft_5h` nor a weekly window to its limit. Among those,
-  `smart` weighs the 5h room against the week that expires first: an
-  account whose week resets in 4 hours with 26% unused comes before one
-  with three days left, unless that one has about half a 5h window more
-  room.
+  `smart` takes first an account whose week resets within 5 hours: what
+  it has not used by then is lost. Otherwise it weighs the 5h room against
+  the week that expires first: an account whose week resets in 8 hours
+  with 30% unused comes before one with three days left, unless that one
+  has about half a 5h window more room.
 - `agp status --json` has `runs`, `load_5h` (expected 5h use one hour from
   now) and `usable` per account, and `capacity`: how many more runs fit
   before no account has room for one.
